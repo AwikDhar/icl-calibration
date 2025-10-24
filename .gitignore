@@ -1,7 +1,13 @@
-openai_key.txt
-
 *.pyc
 *.out
+*.log
+*.json
+*.pkl
+*.pt
+*.png
+
+setup.sh
+vllm_test.py
 
 results/
 saved_results/
