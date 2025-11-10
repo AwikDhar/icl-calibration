@@ -475,7 +475,7 @@ def load_amazon_counterfactual():
 
 def load_newsgroups():
     dataset = datasets.load_dataset('SetFit/20_newsgroups').shuffle(seed=42)
-    dataset = dataset.filter(lambda example: len(example['text'])<3000) # some examples are tens of thousads of chars long
+    dataset = dataset.filter(lambda example: len(example['text'])<1000) # some examples are tens of thousads of chars long
     
     labels = sorted(dataset['train'].unique("label_text")) # classes
     label_idx_map = {label:idx for idx, label in enumerate(labels)}
@@ -594,6 +594,18 @@ def load_goemotions():
     
     return train_sentences, train_labels, test_sentences, test_labels
 
+def load_yelp_reviews():
+    dataset = datasets.load_dataset('Yelp/yelp_review_full').shuffle(seed=42)
+    dataset = dataset.filter(lambda example: len(example['text'])<1000) 
+    dataset['train'] = dataset['train'].select(range(10**5))
+
+    train_sentences = list(dataset['train']['text'])
+    train_labels = list(dataset['train']['label'])
+    test_sentences = list(dataset['test']['text'])
+    test_labels = list(dataset['test']['label'])
+    
+    return train_sentences, train_labels, test_sentences, test_labels
+
 def load_dataset(params):
     """
     Load train and test data
@@ -671,6 +683,9 @@ def load_dataset(params):
     elif params['dataset'] == 'goemotions':
         orig_train_sentences, orig_train_labels, orig_test_sentences, orig_test_labels = load_goemotions()
 
+    elif params['dataset'] == 'yelp_reviews':
+        orig_train_sentences, orig_train_labels, orig_test_sentences, orig_test_labels = load_yelp_reviews()
+        
     elif params['dataset'] == 'strategy_qa':
         params['prompt_prefix'] = ""
         params["q_prefix"] = "Question: "

@@ -1,63 +1,65 @@
 import argparse
 import json
-from typing import Dict
-from calibration.train import get_batch, load_datasets, convert_to_list
-from utils import convert_to_list
 import os
+from typing import Dict
 
 import torch
 import torch.nn.functional as F
-from calibration.model import CalibrationTransformer
-from losses import ECELoss
 import numpy as np
 
+from calibration.model import CalibrationTransformer
+from losses import ECELoss
+from metrics import Metrics
+
+from calibration.train import get_batch, load_datasets, convert_to_list
+from utils import convert_to_list
 from plot_results.plot_tc import plot_calibration
 
-def main(model, datasets, feature_type, sampling_strategy = None, gpu_id=0, model_path=None, save_path=None):
-    ece_loss = ECELoss(n_bins=30)
+def main(models, datasets, feature_type, shots_start, sampling_strategy = None, gpu_id=0, model_path=None, llm_agnostic=False, save_path=None):
     device = f'cuda:{gpu_id}'
     
-    data = load_datasets(model, datasets, device, feature_type, splits=('test',), sampling_strategy=sampling_strategy, apply_features=False)
+    data = load_datasets(models, datasets, device, feature_type, splits=('test',), sampling_strategy=sampling_strategy, temp_augment=False)
     
     with open(f"calibration/models/transformer_config.json", 'r') as file:
         config = json.load(file)
     
-    calibrator = None
-    
-    for dataset in datasets:
-        if model_path is None:
-            model_dir = f"./calibration/models/{model.replace('/','_')}/{dataset}"
-            model_path = f'{model_dir}/calibrator'
-            os.makedirs(model_dir, exist_ok=True)
-    
-        if calibrator is None:
-            T, C = data[dataset]['test']['inputs'][0].shape
-            # print(data['train'][0]['inputs'].shape, data['train'][0]['logits'].shape, data['train'][0]['labels'].shape)
-            # exit()
-            calibrator = CalibrationTransformer(
-            in_features=C, 
-                context_length=config['context_length'], 
-                embedding_dim=config['embedding_dim'], 
-                num_heads=config['num_heads'], 
-                num_layers=config['num_layers']
-            ).to(device)
-            # print(calibrator)
-            state_dict = torch.load(model_path, weights_only=True)
-            cleaned_state_dict = {}
-            for key, value in state_dict.items():
-                if key.startswith('_orig_mod.'):
-                    cleaned_state_dict[key.replace('_orig_mod.', '')] = value
-                else:
-                    cleaned_state_dict[key] = value
+    if model_path is None:
+        if llm_agnostic or len(models)>1:
+            model_dir = f"./calibration/models/llm_agnostic"
+        else:
+            model_dir = f"./calibration/models/{models[0].replace('/','_')}"
+            
+        model_path = f'{model_dir}/calibrator'
 
-            calibrator.load_state_dict(cleaned_state_dict)    
+    sample_model, sample_dataset = models[0], datasets[0]
+    T, C = data[sample_model][sample_dataset]['test']['inputs'][0].shape
+    calibrator = CalibrationTransformer(
+    in_features=C, 
+        context_length=config['context_length'], 
+        embedding_dim=config['embedding_dim'], 
+        num_heads=config['num_heads'], 
+        num_layers=config['num_layers']
+    ).to(device)
+    # print(calibrator)
 
-        ece_shots_map, temp_shots_map, conf_shots_map, accuracies = eval(calibrator, data, dataset, device, ece_loss)
-        
-        plot_calibration(ece_shots_map, temp_shots_map, conf_shots_map, accuracies, 
-                         model, dataset, feature_type, sampling_strategy, save_path=save_path)
+    state_dict = torch.load(model_path, weights_only=True)
+    cleaned_state_dict = {}
+    for key, value in state_dict.items():
+        if key.startswith('_orig_mod.'):
+            cleaned_state_dict[key.replace('_orig_mod.', '')] = value
+        else:
+            cleaned_state_dict[key] = value
+
+    calibrator.load_state_dict(cleaned_state_dict)
+          
+    for llm in models:
+        for dataset in datasets:
+            ece_shots_map, temp_shots_map, conf_shots_map, accuracies = eval(calibrator, data, llm, dataset, shots_start, device)
+            
+            plot_calibration(ece_shots_map, temp_shots_map, conf_shots_map, accuracies, 
+                            llm, dataset, feature_type, llm_agnostic, sampling_strategy, save_path=save_path)
     
-def eval(model, eval_data, dataset, device, ece_loss):
+def eval(model, data, llm, dataset, shots_start, device):
     ece_shots_map = {'calibrated':{}, 'original':{}}
     temp_shots_map = {}
     conf_shots_map = {'calibrated':{}, 'original':{}}
@@ -65,7 +67,7 @@ def eval(model, eval_data, dataset, device, ece_loss):
     
     model.eval()
     with torch.no_grad():
-        inputs, logits, labels = get_batch(eval_data[dataset]['test'], batch_size=None, device=device) # len(eval),T,C | len(eval),T,num_classes | len(eval),T
+        inputs, logits, labels = get_batch(data[llm][dataset]['test'], batch_size=None, device=device) # len(eval),T,C | len(eval),T,num_classes | len(eval),T
         
         temperatures = model(inputs) # B,T,1
         temperatures = torch.nan_to_num(temperatures, nan=1.0)
@@ -80,12 +82,11 @@ def eval(model, eval_data, dataset, device, ece_loss):
         probs, preds = F.softmax(logits, dim=-1).max(dim=-1)
         calibrated_probs, calibrated_preds = F.softmax(calibrated_logits, dim=-1).max(dim=-1)
 
-        for shot in range(T):
-            ece = ece_loss(logits[:,shot, :], labels[:,shot])
-            calibrated_ece = ece_loss(calibrated_logits[:,shot, :], labels[:,shot])
-            
-            ece_shots_map['original'][shot] = ece.item()
-            ece_shots_map['calibrated'][shot] = calibrated_ece.item()
+        print(f"|------Dataset: {dataset}------|")
+        for shot in range(shots_start, T):
+            eval_metrics = Metrics(logits[:, [shot], :], calibrated_logits[:, [shot], :], labels[:, [shot]], 0)
+            ece_shots_map['original'][shot] = eval_metrics.ece
+            ece_shots_map['calibrated'][shot] = eval_metrics.calibrated_ece
             
             temp_shots_map[shot] = temperatures[:,shot,:].flatten().cpu().numpy()
 
@@ -93,10 +94,9 @@ def eval(model, eval_data, dataset, device, ece_loss):
             conf_shots_map['original'][shot] = np.ma.masked_invalid(probs[:, shot].cpu()).mean()
             conf_shots_map['calibrated'][shot] = np.ma.masked_invalid(calibrated_probs[:, shot].cpu()).mean()
             
-            print(f"{shot} shot accuracy {accuracies[shot]:.4f}, \
+            print(f"{shot} shot accuracy {accuracies[shot-shots_start]:.4f}, \
                     mean prob {conf_shots_map['original'][shot]:.4f}   \
                     mean calibrated prob {conf_shots_map['calibrated'][shot]:.4f}")
-        
         # exit()
         # print(torch.isnan(temperatures).any()) ;exit()
         # print(ece_loss(calibrated_logits, labels)); exit()
@@ -105,18 +105,21 @@ def eval(model, eval_data, dataset, device, ece_loss):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--model', dest='model', action='store', required=True, help='name of model to ecal the calibrator on')
+    parser.add_argument('--models', dest='models', action='store', required=True, help='name of models to eval the calibrator on')
     parser.add_argument('--datasets', dest='datasets', action='store', required=True, help='name of datasets to eval the calibrator on')    
     parser.add_argument('--feature_type', dest='feature_type', action='store', required=False, default="class_agnostic", help='the type of input features that make up the dataset')
+    parser.add_argument('--shots_start', dest='shots_start', action='store', required=False, type=int, default=2, help='which shot # onwards we will do calibration for training and eval')
     parser.add_argument('--sampling_strategy', dest='sampling_strategy', action='store', required=False, default=None, help='what sampling strategy data to select(entropy vs similarity) (default: None - means select all)')
     parser.add_argument('--gpu_id', dest='gpu_id', action='store', default=0, required=False, help='Which CUDA gpu to run model on', type=int)
     parser.add_argument('--model_path', dest='model_path', action='store', default=None, required=False, help='Path of the model to be loaded ')
+    parser.add_argument('--llm_agnostic', dest='llm_agnostic', action='store_const', const=True, default=False, help='whether to use the llm agnostic calibrator')
     parser.add_argument('--save_path', dest='save_path', action='store', default=None, required=False, help='What path to save the calibration plot to ')
     
     args = parser.parse_args()
     args = vars(args)
-    # print(args)
+
     args['datasets'] = convert_to_list(args['datasets'])
+    args['models'] = convert_to_list(args['models'])
     
     sampling_strategy = args.get('sampling_strategy')
     if sampling_strategy:

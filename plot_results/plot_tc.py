@@ -14,6 +14,7 @@ def plot_calibration(
         model: str, 
         dataset: str,
         feature_type: str = None,
+        llm_agnostic: bool = False,
         sampling_strategy: str = None,
         save_path=None
     ):
@@ -63,6 +64,8 @@ def plot_calibration(
         dir_name = f"plot_results/calibration/TC/{model.replace('/','_')}/{dataset}"
         if feature_type is not None:
             dir_name += f"/{feature_type}"
+        if llm_agnostic:
+            dir_name += f"/llm_agnostic"
         if sampling_strategy is not None:
             dir_name += f"/{sampling_strategy}"
             

@@ -2,37 +2,50 @@ import json
 import pickle
 import os
 import glob
-import datasets
+# import datasets
 # from data_utils_old import load_commonsense_qa
 import numpy as np
 import pandas as pd
 import torch
-import datasets
 
-model = 'meta-llama/Llama-3.1-8B-Instruct'
-dataset = 'qqp/class_agnostic'
+
+model = 'Qwen/Qwen3-8B'# # 'openai/gpt-oss-20b' 'Qwen/Qwen3-8B'
+# model = 'openai/gpt-oss-20b'
+# model = 'meta-llama/Llama-3.1-8B-Instruct'
+datasets = ['sst5', 'snli', 'trec', 'rte', 'agnews', 'goemotions', 'dbpedia_l2', 'toxic_chat', 'newsgroups']
+
 split = 'test'
+# split = 'train'
+
+if split == 'test':
+    datasets += ['commonsense_qa', 'qqp', 'banking77', 'metatool', 'wildguard', 'when2call', 'wikitoxic', 'amazon_counterfactual', 'massive_intent', 'dbpedia_l1']
+# datasets = ['metatool', 'dbpedia_l1' 'amazon_counterfactual', 'massive_intent', 'wildguard', 'commonsense_qa', 'qqp']
 # print(os)
 # icl-calibration/calibration/datasets/meta-llama_Llama-3.1-8B-Instruct/commonsense_qa
-# with open(f"calibration/datasets/{model.replace('/','_')}/{dataset}/{split}.json") as file:
-#     data = json.load(file)
-#     for idx in range(len(data)):
-#         # print(data[idx]['inputs'][0])
-#         data[idx]['inputs'][0][2] = -1
-#         # print(data[idx]['inputs'][0])
-#         # exit()
+for idx, dataset in enumerate(datasets):
+    print(f'\n{idx+1}. '+dataset + ': ')
+    # for split in ('train', ):
+    try:
+        with open(f"calibration/datasets/{model.replace('/','_')}/{dataset}/class_agnostic/{split}.json") as file:
+            data = json.load(file)
+            # if len(data)>1000:
+            #     data = data[1000:]
+            sim_count = len([True for item in data if item['sampling_strategy']=='ENTROPY'])
+            ratio = sim_count/len(data)
+            print(f' {split} size: {len(data)}')
+            if abs(ratio-0.5)>0.1:
+                print(f' Imbalanced {split} split: {sim_count/len(data)}')
+    except Exception as e:
+        print(e)
+    # print('-----------')
+        # exit()
 # with open(f"calibration/datasets/{model.replace('/','_')}/{dataset}/{split}.json", 'w') as file:
 #     json.dump(data, file, indent=2)
             
 # with open(f"data/when2call/test.json", 'r') as file:
 #     data = json.load(file)
 #     print(data[0]['sentence'])
-            
-a = torch.tensor([ 89.0])
-b = torch.logsumexp(a, dim=0).cpu().numpy()
-print(b)
 
-print(np.exp( a ))
 # print(np.exp( b ))
 # print(np.exp(a))
 # print(torch.exp(torch.tensor([83, 86, 87, 88.75, 89], dtype=torch.float64)))

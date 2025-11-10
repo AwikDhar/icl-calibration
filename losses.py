@@ -1,5 +1,6 @@
 import math
 
+import relplot
 import torch
 import torch.nn.functional as F
 from torch import nn
@@ -66,3 +67,32 @@ class ECELoss(nn.Module):
                 # exit()
         # print(torch.sum(accuracies).item() / logits.shape[0], ece)
         return ece
+    
+def brier_score(logits, labels):
+    probs = F.softmax(logits, dim=-1)
+    labels_one_hot = torch.zeros_like(probs)
+    # print(labels_one_hot.shape, labels.shape, logits.shape); exit()
+    labels_one_hot[torch.arange(len(labels)), labels] = 1
+    
+    loss = torch.mean((probs-labels_one_hot)**2)
+    
+    return loss
+
+def smooth_ece(logits, labels):
+    conf, acc = relplot.multiclass_logits_to_confidences(logits, labels) # reduce to binary setting
+    ece = relplot.smECE(f=conf, y=acc) # compute smECE of confidence calibration
+
+    return ece 
+
+class BrierLoss(nn.Module):
+    def __init__(self, shots_start: int):
+        super().__init__()
+        self.shots_start = shots_start
+        
+    def forward(self, logits, labels):
+        B, T, num_classes = logits.shape
+        
+        logits = logits[:,self.shots_start:,:].reshape(B*(T-self.shots_start), num_classes)
+        labels = labels[:,self.shots_start:].reshape(B*(T-self.shots_start))
+        
+        return brier_score(logits, labels)
