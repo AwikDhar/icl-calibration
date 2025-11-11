@@ -4,7 +4,7 @@
 *.json
 *.pkl
 *.pt
-*.png
+# *.png
 
 setup.sh
 vllm_test.py
