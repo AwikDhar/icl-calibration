@@ -19,6 +19,8 @@ from metrics import Metrics
 
 def recalculate_features(item: Dict):
     # print(item['inputs'])
+    item['inputs'] = item['inputs'][:,]
+    return 
     recalculate = torch.empty(1).uniform_(0,1).item()>0.7 # 30 # chance of recalculating features
     if not recalculate:
         return
