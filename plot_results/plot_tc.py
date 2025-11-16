@@ -2,9 +2,9 @@ import argparse
 import os
 import pickle
 from calibration_plot_data import CalibrationPlotData
-from typing import Dict, List
 import matplotlib.pyplot as plt
 import numpy as np
+import relplot
 
 def plot_calibration(
         calibration_data: CalibrationPlotData,
@@ -52,24 +52,57 @@ def plot_calibration(
     
     ax3.set_xlabel('Shots', fontsize=12)
     ax3.set_ylabel('Accuracy/Confidence', fontsize=12)
-    ax3.set_title(f'Accuracies and confidence means', fontsize=12)
+    ax3.set_title('Accuracies and confidence means', fontsize=12)
     ax3.legend()
     
     plt.tight_layout()
     
+    dir_name = f"plot_results/calibration/TC/{model.replace('/','_')}/{dataset}"    
+    if feature_type is not None:
+        dir_name += f"/{feature_type}"
+    if llm_agnostic:
+        dir_name += f"/llm_agnostic"
+    if sampling_strategy is not None:
+        dir_name += f"/{sampling_strategy}"    
+    os.makedirs(dir_name, exist_ok=True)
+    
     if save_path is None:
-        dir_name = f"plot_results/calibration/TC/{model.replace('/','_')}/{dataset}"
-        if feature_type is not None:
-            dir_name += f"/{feature_type}"
-        if llm_agnostic:
-            dir_name += f"/llm_agnostic"
-        if sampling_strategy is not None:
-            dir_name += f"/{sampling_strategy}"
-            
-        os.makedirs(dir_name, exist_ok=True)
         save_path = f"{dir_name}/tc_ece.png"
         
     plt.savefig(save_path, dpi=600)
+    plt.close()
+    
+    fig, (ax1, ax2) = plt.subplots(1,2, figsize=(12,6))
+    fig.suptitle("Reliability Diagram Overall", fontsize=15, fontweight='bold')
+    
+    relplot.plot_rel_diagram(calibration_data.overall_reldiag['original'], fig, ax1)
+    relplot.plot_rel_diagram(calibration_data.overall_reldiag['calibrated'], fig, ax2)
+    
+    ax1.set_title("Original", fontsize=12)
+    ax2.set_title("Calibrated", fontsize=12)
+    plt.tight_layout()
+    
+    save_path = f"{dir_name}/rel_diagram.png"
+    fig.savefig(save_path)
+    plt.close()
+    
+    fig, ax = plt.subplots(2, len(shots), figsize=(30,15))
+    fig.suptitle("Reliability Diagram Shot-wise", fontsize=30, fontweight='bold')
+    plt.tight_layout()
+    
+    for idx, shot in enumerate(shots):
+        diagram = calibration_data.reldiag_shots_map['original'][shot]
+        calibrated_diagram = calibration_data.reldiag_shots_map['calibrated'][shot]
+        
+        relplot.plot_rel_diagram(diagram, fig=fig, ax=ax[0,idx])
+        relplot.plot_rel_diagram(calibrated_diagram, fig=fig, ax=ax[1,idx])
+    
+        ax[0,idx].set_title(f"Original | {shot} shot", fontsize=20)
+        ax[1,idx].set_title(f"Calibrated | {shot} shot", fontsize=20)
+        
+    save_path = f"{dir_name}/rel_diagram_shotwise.png"
+    fig.savefig(save_path)    
+    plt.close()
     
 def main(models, datasets, num_seeds, all_shots, sampling_strategy):
     root_node = dict()

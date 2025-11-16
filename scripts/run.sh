@@ -7,7 +7,8 @@ python -m calibration.generate_calibration_dataset --model="meta-llama/Llama-3.1
 
 python -m calibration.train --models="meta-llama/Llama-3.1-8B-Instruct" --datasets="snli, sst5, rte, agnews, trec, dbpedia_l2, toxic_chat" --iterations=40000 --batch_size=8 --eval_iter=400 --lr=0.00001
 
-python -m calibration.eval --models="meta-llama/Llama-3.1-8B-Instruct" --datasets="qqp" --model_path="./calibration/models/meta-llama_Llama-3.1-8B-Instruct/snli_sst5_rte_agnews_trec/calibrator" --gpu_id=0
+python -m calibration.eval --models="meta-llama/Llama-3.1-8B-Instruct" --datasets="qqp" --gpu_id=0
+python -m calibration.eval --models="meta-llama/Llama-3.1-8B-Instruct" --datasets="commonsense_qa, qqp, banking77, metatool, wildguard, when2call, amazon_counterfactual, massive_intent, dbpedia_l1, wikitoxic" --gpu_id=1
 
 for d in */; do
   printf "%s %s\n" "$(find "$d" -type f -printf '%T@\n' 2>/dev/null | sort -n | tail -1)" "$d"

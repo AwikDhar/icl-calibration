@@ -79,7 +79,8 @@ def eval(model, data, llm, dataset, shots_start, device):
 
         print(f"|------Dataset: {dataset}------|")
         for shot in range(shots_start, T):
-            eval_metrics = Metrics(logits[:, [shot], :], calibrated_logits[:, [shot], :], labels[:, [shot]], 0)
+            eval_metrics = Metrics(logits[:, [shot], :], calibrated_logits[:, [shot], :], labels[:, [shot]], 
+                                   shots_start=0, prepare_rel_diag=True)
      
             calibration_data.ece_shots_map['original'][shot] = eval_metrics.ece
             calibration_data.ece_shots_map['calibrated'][shot] = eval_metrics.calibrated_ece
@@ -102,6 +103,9 @@ def eval(model, data, llm, dataset, shots_start, device):
         # exit()
         # print(torch.isnan(temperatures).any()) ;exit()
         # print(ece_loss(calibrated_logits, labels)); exit()
+        
+        overall_metrics = Metrics(logits, calibrated_logits, labels, shots_start=shots_start, prepare_rel_diag=True)
+        calibration_data.overall_reldiag = {"original":overall_metrics.rel_diag, "calibrated":overall_metrics.calibrated_rel_diag}
         
         return calibration_data
     

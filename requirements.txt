@@ -1,6 +1,10 @@
-numpy == 1.19.2
-torch == 1.9.0
-transformers==4.27.4
-openai == 0.3.0
-pandas == 1.1.5 
-tensor_parallel
+accelerate==1.10.0
+datasets==4.0.0
+EETQ @ file:///mnt/nas/awikdhar/calibration/tmp/EETQ
+ninja==1.13.0
+numpy==2.2.6
+pandas==2.3.1
+relplot==1.0.1
+tqdm==4.67.1
+transformers==4.55.2
+vllm==0.10.1.1

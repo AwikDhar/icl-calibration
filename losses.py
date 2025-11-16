@@ -78,12 +78,13 @@ def brier_score(logits, labels):
     
     return loss
 
-def smooth_ece(logits, labels, plot_rel_diag=False):
+def smooth_ece(logits, labels, prepare_rel_diag=False):
     conf, acc = relplot.multiclass_logits_to_confidences(logits, labels) # reduce to binary setting
     ece = relplot.smECE(f=conf, y=acc) # compute smECE of confidence calibration
-    if plot_rel_diag:
-        fig, ax = relplot.rel_diagram(f=conf, y=acc)
-        return ece, fig
+    if prepare_rel_diag:
+        # fig, ax = relplot.rel_diagram(f=conf, y=acc)
+        diagram = relplot.prepare_rel_diagram(f=conf, y=acc)
+        return ece, diagram
     return ece
 
 class BrierLoss(nn.Module):
