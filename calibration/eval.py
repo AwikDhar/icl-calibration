@@ -8,9 +8,8 @@ import torch.nn.functional as F
 import numpy as np
 
 from calibration.model import CalibrationTransformer
-from losses import ECELoss
 from metrics import Metrics
-
+from calibration_plot_data import CalibrationPlotData
 from calibration.train import get_batch, load_datasets, convert_to_list
 from utils import convert_to_list
 from plot_results.plot_tc import plot_calibration
@@ -18,7 +17,7 @@ from plot_results.plot_tc import plot_calibration
 def main(models, datasets, feature_type, shots_start, sampling_strategy = None, gpu_id=0, model_path=None, llm_agnostic=False, save_path=None):
     device = f'cuda:{gpu_id}'
     
-    data = load_datasets(models, datasets, device, feature_type, splits=('test',), sampling_strategy=sampling_strategy, temp_augment=False)
+    data = load_datasets(models, datasets, device, feature_type, splits=('test',), sampling_strategy=sampling_strategy, temp_augment=True)
     
     with open(f"calibration/models/transformer_config.json", 'r') as file:
         config = json.load(file)
@@ -54,16 +53,12 @@ def main(models, datasets, feature_type, shots_start, sampling_strategy = None, 
           
     for llm in models:
         for dataset in datasets:
-            ece_shots_map, temp_shots_map, conf_shots_map, accuracies = eval(calibrator, data, llm, dataset, shots_start, device)
+            calibration_data = eval(calibrator, data, llm, dataset, shots_start, device)
             
-            plot_calibration(ece_shots_map, temp_shots_map, conf_shots_map, accuracies, 
-                            llm, dataset, feature_type, llm_agnostic, sampling_strategy, save_path=save_path)
+            plot_calibration(calibration_data, llm, dataset, feature_type, llm_agnostic, sampling_strategy, save_path=save_path)
     
 def eval(model, data, llm, dataset, shots_start, device):
-    ece_shots_map = {'calibrated':{}, 'original':{}}
-    temp_shots_map = {}
-    conf_shots_map = {'calibrated':{}, 'original':{}}
-    accuracies = []
+    calibration_data = CalibrationPlotData()
     
     model.eval()
     with torch.no_grad():
@@ -85,22 +80,30 @@ def eval(model, data, llm, dataset, shots_start, device):
         print(f"|------Dataset: {dataset}------|")
         for shot in range(shots_start, T):
             eval_metrics = Metrics(logits[:, [shot], :], calibrated_logits[:, [shot], :], labels[:, [shot]], 0)
-            ece_shots_map['original'][shot] = eval_metrics.ece
-            ece_shots_map['calibrated'][shot] = eval_metrics.calibrated_ece
+     
+            calibration_data.ece_shots_map['original'][shot] = eval_metrics.ece
+            calibration_data.ece_shots_map['calibrated'][shot] = eval_metrics.calibrated_ece
             
-            temp_shots_map[shot] = temperatures[:,shot,:].flatten().cpu().numpy()
+            calibration_data.brier_shots_map['original'][shot] = eval_metrics.brier_score
+            calibration_data.brier_shots_map['calibrated'][shot] = eval_metrics.calibrated_brier_score
+            
+            calibration_data.reldiag_shots_map['original'][shot] = eval_metrics.rel_diag
+            calibration_data.reldiag_shots_map['calibrated'][shot] = eval_metrics.calibrated_rel_diag
+            
+            calibration_data.temp_shots_map[shot] = temperatures[:,shot,:].flatten().cpu().numpy()
 
-            accuracies.append((labels==preds).cpu()[:, shot].sum()/len(preds))
-            conf_shots_map['original'][shot] = np.ma.masked_invalid(probs[:, shot].cpu()).mean()
-            conf_shots_map['calibrated'][shot] = np.ma.masked_invalid(calibrated_probs[:, shot].cpu()).mean()
+            calibration_data.accuracies.append((labels==preds).cpu()[:, shot].sum()/len(preds))
+            calibration_data.conf_shots_map['original'][shot] = np.ma.masked_invalid(probs[:, shot].cpu()).mean()
+            calibration_data.conf_shots_map['calibrated'][shot] = np.ma.masked_invalid(calibrated_probs[:, shot].cpu()).mean()
             
-            print(f"{shot} shot accuracy {accuracies[shot-shots_start]:.4f}, \
-                    mean prob {conf_shots_map['original'][shot]:.4f}   \
-                    mean calibrated prob {conf_shots_map['calibrated'][shot]:.4f}")
+            print(f"{shot} shot accuracy {calibration_data.accuracies[shot-shots_start]:.4f}, \
+                    mean prob {calibration_data.conf_shots_map['original'][shot]:.4f}   \
+                    mean calibrated prob {calibration_data.conf_shots_map['calibrated'][shot]:.4f}")
         # exit()
         # print(torch.isnan(temperatures).any()) ;exit()
         # print(ece_loss(calibrated_logits, labels)); exit()
-        return ece_shots_map, temp_shots_map, conf_shots_map, accuracies
+        
+        return calibration_data
     
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

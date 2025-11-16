@@ -1,16 +1,13 @@
 import argparse
 import os
 import pickle
-import random
+from calibration_plot_data import CalibrationPlotData
 from typing import Dict, List
 import matplotlib.pyplot as plt
 import numpy as np
 
 def plot_calibration(
-        ece_shots_map: Dict, 
-        temp_shots_map: Dict,
-        conf_shots_map: Dict,
-        accuracies: List,
+        calibration_data: CalibrationPlotData,
         model: str, 
         dataset: str,
         feature_type: str = None,
@@ -19,7 +16,7 @@ def plot_calibration(
         save_path=None
     ):
 
-    shots = sorted(list(ece_shots_map['original'].keys()))
+    shots = sorted(list(calibration_data.ece_shots_map['original'].keys()))
 
     fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 8))
     title = f"{model} calibration on {dataset}"
@@ -27,8 +24,8 @@ def plot_calibration(
         title += f" | {sampling_strategy.capitalize()}"
     fig.suptitle(title, fontsize=15, fontweight='bold')
 
-    original_ece = [ece_shots_map['original'][shot] for shot in shots]
-    calibrated_ece = [ece_shots_map['calibrated'][shot] for shot in shots]
+    original_ece = [calibration_data.ece_shots_map['original'][shot] for shot in shots]
+    calibrated_ece = [calibration_data.ece_shots_map['calibrated'][shot] for shot in shots]
     
     ax1.plot(shots, original_ece, label='Original', marker='o', color='r')
     ax1.plot(shots, calibrated_ece, label='Calibrated', marker='o', color='g')
@@ -38,7 +35,7 @@ def plot_calibration(
     ax1.set_title(f'Dynamic context Temperature scaling', fontsize=12)
     ax1.legend()
     
-    temps = [temp_shots_map[shot] for shot in shots]
+    temps = [calibration_data.temp_shots_map[shot] for shot in shots]
     
     ax2.boxplot(temps, positions=shots)
     
@@ -46,12 +43,12 @@ def plot_calibration(
     ax2.set_ylabel('Temperature ranges', fontsize=12)
     ax2.set_title(f'Calibration temperatures', fontsize=12)
     
-    original_conf = [conf_shots_map['original'][shot] for shot in shots]
-    calibrated_conf = [conf_shots_map['calibrated'][shot] for shot in shots]
+    original_conf = [calibration_data.conf_shots_map['original'][shot] for shot in shots]
+    calibrated_conf = [calibration_data.conf_shots_map['calibrated'][shot] for shot in shots]
     
     ax3.plot(shots, original_conf, label='Original', marker='o', color='r')
     ax3.plot(shots, calibrated_conf, label='Calibrated', marker='o', color='g')
-    ax3.plot(shots, accuracies, label='Accuracies', marker='s', color='black')
+    ax3.plot(shots, calibration_data.accuracies, label='Accuracies', marker='s', color='black')
     
     ax3.set_xlabel('Shots', fontsize=12)
     ax3.set_ylabel('Accuracy/Confidence', fontsize=12)

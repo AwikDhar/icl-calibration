@@ -13,14 +13,18 @@ import torch.nn as nn
 import torch.nn.functional as F
 from calibration.model import CalibrationTransformer
 from losses import BrierLoss
-from time import time
 from utils import convert_to_list
 from metrics import Metrics
 
 def recalculate_features(item: Dict):
     # print(item['inputs'])
-    item['inputs'] = item['inputs'][:,]
+    brier_scores = torch.cat((torch.tensor([[0.5]]), (1 - item['inputs'][1:,[2]])**2), dim=0)
+    item['inputs'] = torch.cat((brier_scores, item['inputs'][:,:1], item['inputs'][:,4:]), dim=-1)
+    
+    # print(item['inputs'])
+    # exit()
     return 
+
     recalculate = torch.empty(1).uniform_(0,1).item()>0.7 # 30 # chance of recalculating features
     if not recalculate:
         return
@@ -94,6 +98,7 @@ def main(models: List[str],
          batch_size: int,
          temp_augment: bool,
          feature_type: str,
+         sampling_strategy:str,
          resume_saved_ckpt: bool,
          gpu_id: int,
          shots_start: int
@@ -117,7 +122,7 @@ def main(models: List[str],
     
     device = f'cuda:{gpu_id}'
     
-    data = load_datasets(models, datasets, device, feature_type, temp_augment=temp_augment)
+    data = load_datasets(models, datasets, device, feature_type, temp_augment=temp_augment, sampling_strategy=sampling_strategy)
                 
     model_dir = f"./calibration/models/"+ (models[0].replace('/','_') if len(models)==1 else 'llm_agnostic')
     model_path = f'{model_dir}/calibrator'  
@@ -196,7 +201,7 @@ def train(model: nn.Module,
     
     improved = False
     
-    temp_lambda = 0.005
+    temp_lambda = 0.5
     
     optimizer = torch.optim.AdamW(model.parameters(), weight_decay=0.05)
     # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
@@ -232,9 +237,9 @@ def train(model: nn.Module,
                 B,T,num_classes = calibrated_logits.shape
                 loss = F.cross_entropy(calibrated_logits[:,shots_start:,:].reshape(B*(T-shots_start), num_classes), 
                                        labels[:,shots_start:].reshape(B*(T-shots_start)))
-                # temp_regularizar_loss = torch.mean((temperatures-1.0)**2)
+                temp_regularizar_loss = torch.mean((temperatures-1.0)**2)
                 
-                total_loss += loss
+                total_loss += loss + temp_lambda*temp_regularizar_loss
                 # total_loss += brier_loss(calibrated_logits, labels) + temp_lambda*temp_regularizar_loss
                             
             if (iter+1)%eval_iter==0:
@@ -367,6 +372,7 @@ if __name__ == '__main__':
     parser.add_argument('--datasets', dest='datasets', action='store', required=True, help='name of dataset to train the calibrator for')
     parser.add_argument('--datasets_dropout', dest='datasets_dropout', action='store', required=False, default=0.8, help='fraction of datasets randomly dropped out each training iteration')
     parser.add_argument('--feature_type', dest='feature_type', action='store', required=False, default="class_agnostic", help='the type of input features that make up the dataset')
+    parser.add_argument('--sampling_strategy', dest='sampling_strategy', action='store', required=False, default=None, help='what sampling strategy data to select(entropy vs similarity) (default: None - means select all)')
     parser.add_argument('--shots_start', dest='shots_start', action='store', required=False, type=int, default=2, help='which shot # onwards we will do calibration for training and eval')
     parser.add_argument('--temp_augment', dest='temp_augment', action='store_const', const=True, default=False,
                         help="Whether or not to randomly temperature scale data logits(and affect features) for robust training")

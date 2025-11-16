@@ -5,18 +5,29 @@ from copy import deepcopy
 
 # metrics over a single/bunch of datasets(post averaging using the dunder methods)
 class Metrics():
-    def __init__(self, logits: torch.tensor, calibrated_logits: torch.tensor, labels: torch.tensor, shots_start: int):
+    def __init__(self, logits: torch.tensor, calibrated_logits: torch.tensor, 
+                 labels: torch.tensor, shots_start: int, plot_rel_diag: bool = False):
+        # Reshape tensors: flatten batch and time dimensions after shots_start
         B, T, num_classes = logits.shape
-        logits = logits[:,shots_start:,:].reshape(B*(T-shots_start), num_classes).detach().cpu()
-        calibrated_logits = calibrated_logits[:,shots_start:,:].reshape(B*(T-shots_start), num_classes).detach().cpu()
-        labels = labels[:,shots_start:].reshape(B*(T-shots_start)).detach().cpu()
+        N = B * (T - shots_start)  # Total samples
         
-        self.ece = smooth_ece(logits, labels).item()
-        self.calibrated_ece = smooth_ece(calibrated_logits, labels).item()
+        logits = logits[:, shots_start:, :].reshape(N, num_classes).detach().cpu()
+        calibrated_logits = calibrated_logits[:, shots_start:, :].reshape(N, num_classes).detach().cpu()
+        labels = labels[:, shots_start:].reshape(N).detach().cpu()
+        
+        self.ece,            self.rel_diag            = self._compute_ece(logits,            labels, plot_rel_diag)
+        self.calibrated_ece, self.calibrated_rel_diag = self._compute_ece(calibrated_logits, labels, plot_rel_diag)            
         
         self.brier_score = brier_score(logits, labels).item()
         self.calibrated_brier_score = brier_score(calibrated_logits, labels).item()
 
+    def _compute_ece(self, logits, labels, plot_rel_diag):
+        """Helper to compute ECE and optionally return reliability diagram."""
+        out = smooth_ece(logits, labels, plot_rel_diag)
+        if plot_rel_diag:
+            return out[0].item(), out[1]
+        return out.item(), None
+    
     @classmethod
     def zeros(cls):
         obj = cls.__new__()
