@@ -194,7 +194,7 @@ def set_prompt_params(params: Dict):
         
     elif params['dataset'].startswith('dbpedia'):
         level = int(params['dataset'][-1])
-        assert params['dataset'] in ('dbpedia_l1', 'dbpedia_l2'), "only dbpedia_l1 and dbpedia_l2 datasets names allowed (9/20 classes)"
+        assert params['dataset'] in ('dbpedia_l1', 'dbpedia_l2'), "only dbpedia_l1 and dbpedia_l2 datasets names allowed (9/70 classes)"
         
         dataset = datasets.load_dataset('DeveloperOats/DBPedia_Classes')
         labels = sorted(dataset['train'].unique(f'l{level}')) # classes
@@ -292,15 +292,15 @@ def set_prompt_params(params: Dict):
         params["a_prefix"] = "answer: "
         params['label_dict'] = {0: 'false', 1: 'neither', 2: 'true'}
 
-    elif params['dataset'] == 'dbpedia':
-        params['prompt_prefix'] = "Classify the documents based on whether they are about a Company, School, Artist, Athlete, Politician, Transportation, Building, Nature, Village, Animal, Plant, Album, Film, or Book.\n\n"
-        params["q_prefix"] = "Article: "
-        params["a_prefix"] = "Answer: "
-        params['label_dict'] = {
-            0: 'Company', 1: 'School', 2: 'Artist', 3: 'Ath', 4: 'Polit',
-            5: 'Transportation', 6: 'Building', 7: 'Nature', 8: 'Village',
-            9: 'Animal', 10: 'Plant', 11: 'Album', 12: 'Film', 13: 'Book'
-        }
+    # elif params['dataset'] == 'dbpedia':
+    #     params['prompt_prefix'] = "Classify the documents based on whether they are about a Company, School, Artist, Athlete, Politician, Transportation, Building, Nature, Village, Animal, Plant, Album, Film, or Book.\n\n"
+    #     params["q_prefix"] = "Article: "
+    #     params["a_prefix"] = "Answer: "
+    #     params['label_dict'] = {
+    #         0: 'Company', 1: 'School', 2: 'Artist', 3: 'Ath', 4: 'Polit',
+    #         5: 'Transportation', 6: 'Building', 7: 'Nature', 8: 'Village',
+    #         9: 'Animal', 10: 'Plant', 11: 'Album', 12: 'Film', 13: 'Book'
+    #     }
 
     else:
         raise NotImplementedError

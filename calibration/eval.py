@@ -17,7 +17,7 @@ from plot_results.plot_tc import plot_calibration
 def main(models, datasets, feature_type, shots_start, sampling_strategy = None, gpu_id=0, model_path=None, llm_agnostic=False, save_path=None):
     device = f'cuda:{gpu_id}'
     
-    data = load_datasets(models, datasets, device, feature_type, splits=('test',), sampling_strategy=sampling_strategy, temp_augment=True)
+    data = load_datasets(models, datasets, device, feature_type, splits=('test','train'), sampling_strategy=sampling_strategy, temp_augment=True)
     
     with open(f"calibration/models/transformer_config.json", 'r') as file:
         config = json.load(file)
@@ -50,15 +50,26 @@ def main(models, datasets, feature_type, shots_start, sampling_strategy = None, 
             cleaned_state_dict[key] = value
 
     calibrator.load_state_dict(cleaned_state_dict)
-          
+    
+    dataset_eces = []
+    
     for llm in models:
         for dataset in datasets:
             calibration_data = eval(calibrator, data, llm, dataset, shots_start, device)
+            dataset_ece = calibration_data.overall_reldiag['calibrated']['ce']
             
+            print("Overall ECE: ", dataset_ece)
+            dataset_eces.append(dataset_ece)        
+            # continue
             plot_calibration(calibration_data, llm, dataset, feature_type, llm_agnostic, sampling_strategy, save_path=save_path)
+    
+    print("\n**Eval datasets average ECE: ", np.mean(dataset_eces), " **")
     
 def eval(model, data, llm, dataset, shots_start, device):
     calibration_data = CalibrationPlotData()
+    static_temp_calibration_data = CalibrationPlotData()
+    
+    shotwise_static_temps = get_shotwise_static_temperatures(data[llm][dataset]['train'], shots_start)
     
     model.eval()
     with torch.no_grad():
@@ -67,7 +78,7 @@ def eval(model, data, llm, dataset, shots_start, device):
         temperatures = model(inputs) # B,T,1
         temperatures = torch.nan_to_num(temperatures, nan=1.0)
 
-        calibrated_logits = logits*temperatures # B,T,num_classes
+        calibrated_logits = logits*temperatures # B,T,num_classes * B,T,1
         
         B,T,num_classes = calibrated_logits.shape
         # loss = F.cross_entropy(calibrated_logits.view(B*T, num_classes), labels.view(B*T))        
@@ -77,29 +88,39 @@ def eval(model, data, llm, dataset, shots_start, device):
         probs, preds = F.softmax(logits, dim=-1).max(dim=-1)
         calibrated_probs, calibrated_preds = F.softmax(calibrated_logits, dim=-1).max(dim=-1)
 
+        mean_valid = lambda x: np.ma.masked_invalid(x.cpu()).mean()
+        
         print(f"|------Dataset: {dataset}------|")
         for shot in range(shots_start, T):
             eval_metrics = Metrics(logits[:, [shot], :], calibrated_logits[:, [shot], :], labels[:, [shot]], 
                                    shots_start=0, prepare_rel_diag=True)
      
-            calibration_data.ece_shots_map['original'][shot] = eval_metrics.ece
-            calibration_data.ece_shots_map['calibrated'][shot] = eval_metrics.calibrated_ece
-            
-            calibration_data.brier_shots_map['original'][shot] = eval_metrics.brier_score
-            calibration_data.brier_shots_map['calibrated'][shot] = eval_metrics.calibrated_brier_score
-            
-            calibration_data.reldiag_shots_map['original'][shot] = eval_metrics.rel_diag
-            calibration_data.reldiag_shots_map['calibrated'][shot] = eval_metrics.calibrated_rel_diag
-            
-            calibration_data.temp_shots_map[shot] = temperatures[:,shot,:].flatten().cpu().numpy()
+            temps = temperatures[:, shot, :].flatten().cpu().numpy()
+            accuracy = (labels == preds).cpu()[:, shot].sum() / len(preds)
+            conf_original = mean_valid(probs[:, shot])
+            conf_calibrated = mean_valid(calibrated_probs[:, shot])
 
-            calibration_data.accuracies.append((labels==preds).cpu()[:, shot].sum()/len(preds))
-            calibration_data.conf_shots_map['original'][shot] = np.ma.masked_invalid(probs[:, shot].cpu()).mean()
-            calibration_data.conf_shots_map['calibrated'][shot] = np.ma.masked_invalid(calibrated_probs[:, shot].cpu()).mean()
+            # static temp scaling
+            static_temp_calibrated_logits = logits[:, [shot], :] * shotwise_static_temps[shot]
+            static_temp_calibrated_probs, static_temp_calibrated_preds = F.softmax(static_temp_calibrated_logits, dim=-1).max(dim=-1)
+
+            # print(static_temp_calibrated_logits[:, [shot], :].shape, labels[:, [shot]].shape, shot); exit()
+            static_temp_eval_metrics = Metrics(logits[:, [shot], :], static_temp_calibrated_logits[:, : , :], labels[:, [shot]], 
+                                   shots_start=0, prepare_rel_diag=False)
+     
+            static_temp_conf_calibrated = mean_valid(static_temp_calibrated_probs[:, :])
+            
+            calibration_data.add_shot_metrics(
+                shot, eval_metrics, static_temp_eval_metrics, 
+                temps, shotwise_static_temps[shot], 
+                accuracy, conf_original, 
+                conf_calibrated, static_temp_conf_calibrated
+            )
             
             print(f"{shot} shot accuracy {calibration_data.accuracies[shot-shots_start]:.4f}, \
-                    mean prob {calibration_data.conf_shots_map['original'][shot]:.4f}   \
-                    mean calibrated prob {calibration_data.conf_shots_map['calibrated'][shot]:.4f}")
+            mean prob {calibration_data.conf_shots_map['original'][shot]:.4f}   \
+            mean calibrated prob {calibration_data.conf_shots_map['calibrated'][shot]:.4f} \
+            mean static temp calibrated prob {calibration_data.conf_shots_map['static_temp_calibrated'][shot]:.4f}")
         # exit()
         # print(torch.isnan(temperatures).any()) ;exit()
         # print(ece_loss(calibrated_logits, labels)); exit()
@@ -108,7 +129,37 @@ def eval(model, data, llm, dataset, shots_start, device):
         calibration_data.overall_reldiag = {"original":overall_metrics.rel_diag, "calibrated":overall_metrics.calibrated_rel_diag}
         
         return calibration_data
+  
+def get_shotwise_static_temperatures(split_data, shots_start):  
+    inputs, logits, labels = get_batch(split_data, batch_size=None) # len(eval),T,C | len(eval),T,num_classes | len(eval),T
     
+    B,T,num_classes = logits.shape
+    tuned_temps = {}
+    
+    for shot in range(shots_start, T):
+        shot_logits, shot_labels = logits[:, shot, :], labels[:, shot]
+        tuned_temps[shot] = tune_temp(shot_logits, shot_labels)
+        
+    return tuned_temps
+
+def tune_temp(logits, labels, lower=0.01, upper=5.0, eps=0.00001):
+
+    logits = logits.detach().cpu()
+    labels = labels.detach().cpu()
+
+    while upper - lower > eps:
+        t_guess = torch.tensor([0.5 * (lower + upper)], requires_grad=True)
+        loss = F.cross_entropy(logits * t_guess, labels)
+        grad = torch.autograd.grad(loss, t_guess)[0]
+        
+        if  grad> 0:
+            upper = 0.5 * (lower + upper)
+        else:
+            lower = 0.5 * (lower + upper)
+        
+    t = min([lower, 0.5 * (lower + upper), upper], key=lambda x: float(F.cross_entropy(logits * x, labels)))
+    return t
+
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 

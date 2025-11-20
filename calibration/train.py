@@ -21,6 +21,12 @@ def recalculate_features(item: Dict):
     brier_scores = torch.cat((torch.tensor([[0.5]]), (1 - item['inputs'][1:,[2]])**2), dim=0)
     item['inputs'] = torch.cat((brier_scores, item['inputs'][:,:1], item['inputs'][:,4:]), dim=-1)
     
+    # T, C = item['inputs'].shape
+    # perturbed_shots = 7
+    # noise = torch.normal(mean=1, std=20, size=(perturbed_shots, C))
+    
+    # item['inputs'][:perturbed_shots,:] += noise
+
     # print(item['inputs'])
     # exit()
     return 
@@ -237,9 +243,9 @@ def train(model: nn.Module,
                 B,T,num_classes = calibrated_logits.shape
                 loss = F.cross_entropy(calibrated_logits[:,shots_start:,:].reshape(B*(T-shots_start), num_classes), 
                                        labels[:,shots_start:].reshape(B*(T-shots_start)))
-                temp_regularizar_loss = torch.mean((temperatures-1.0)**2)
+                temp_regularization_loss = torch.mean((temperatures-1.0)**2)
                 
-                total_loss += loss + temp_lambda*temp_regularizar_loss
+                total_loss += loss + temp_lambda * temp_regularization_loss
                 # total_loss += brier_loss(calibrated_logits, labels) + temp_lambda*temp_regularizar_loss
                             
             if (iter+1)%eval_iter==0:

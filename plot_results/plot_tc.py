@@ -18,42 +18,66 @@ def plot_calibration(
 
     shots = sorted(list(calibration_data.ece_shots_map['original'].keys()))
 
-    fig, (ax1, ax2, ax3) = plt.subplots(1, 3, figsize=(18, 8))
+    fig, ((ax1, ax2), (ax3, ax4)) = plt.subplots(2, 2, figsize=(18, 16))
     title = f"{model} calibration on {dataset}"
     if sampling_strategy is not None:
         title += f" | {sampling_strategy.capitalize()}"
     fig.suptitle(title, fontsize=15, fontweight='bold')
 
+    # ECE plot
     original_ece = [calibration_data.ece_shots_map['original'][shot] for shot in shots]
     calibrated_ece = [calibration_data.ece_shots_map['calibrated'][shot] for shot in shots]
+    static_temp_calibrated_ece = [calibration_data.ece_shots_map['static_temp_calibrated'][shot] for shot in shots]
     
     ax1.plot(shots, original_ece, label='Original', marker='o', color='r')
     ax1.plot(shots, calibrated_ece, label='Calibrated', marker='o', color='g')
+    ax1.plot(shots, static_temp_calibrated_ece, label='Static Temp Calibrated', marker='o', color='b')
     
     ax1.set_xlabel('Shots', fontsize=12)
     ax1.set_ylabel('ECE', fontsize=12)
     ax1.set_title(f'Dynamic context Temperature scaling', fontsize=12)
     ax1.legend()
     
-    temps = [calibration_data.temp_shots_map[shot] for shot in shots]
+    # Brier plot
+    original_brier = [calibration_data.brier_shots_map['original'][shot] for shot in shots]
+    calibrated_brier = [calibration_data.brier_shots_map['calibrated'][shot] for shot in shots]
+    static_temp_calibrated_brier = [calibration_data.brier_shots_map['static_temp_calibrated'][shot] for shot in shots]
     
-    ax2.boxplot(temps, positions=shots)
+    ax2.plot(shots, original_brier, label='Original', marker='o', color='r')
+    ax2.plot(shots, calibrated_brier, label='Calibrated', marker='o', color='g')
+    ax2.plot(shots, static_temp_calibrated_brier, label='Static Temp Calibrated', marker='o', color='b')
     
     ax2.set_xlabel('Shots', fontsize=12)
-    ax2.set_ylabel('Temperature ranges', fontsize=12)
-    ax2.set_title(f'Calibration temperatures', fontsize=12)
+    ax2.set_ylabel('Brier Score', fontsize=12)
+    ax2.set_title(f'Brier Score', fontsize=12)
+    ax2.legend()
     
-    original_conf = [calibration_data.conf_shots_map['original'][shot] for shot in shots]
-    calibrated_conf = [calibration_data.conf_shots_map['calibrated'][shot] for shot in shots]
+    # Temperature plot
+    temps = [calibration_data.temp_shots_map[shot] for shot in shots]
+    static_temps = [calibration_data.static_temp_shots_map[shot] for shot in shots]
     
-    ax3.plot(shots, original_conf, label='Original', marker='o', color='r')
-    ax3.plot(shots, calibrated_conf, label='Calibrated', marker='o', color='g')
-    ax3.plot(shots, calibration_data.accuracies, label='Accuracies', marker='s', color='black')
+    ax3.boxplot(temps, positions=shots)
+    ax3.plot(shots, static_temps, label='Static Temp', marker='x', color='b', linestyle='--')
     
     ax3.set_xlabel('Shots', fontsize=12)
-    ax3.set_ylabel('Accuracy/Confidence', fontsize=12)
-    ax3.set_title('Accuracies and confidence means', fontsize=12)
+    ax3.set_ylabel('Temperature ranges', fontsize=12)
+    ax3.set_title(f'Calibration temperatures', fontsize=12)
     ax3.legend()
+    
+    # Accuracy/Confidence plot
+    original_conf = [calibration_data.conf_shots_map['original'][shot] for shot in shots]
+    calibrated_conf = [calibration_data.conf_shots_map['calibrated'][shot] for shot in shots]
+    static_temp_calibrated_conf = [calibration_data.conf_shots_map['static_temp_calibrated'][shot] for shot in shots]
+    
+    ax4.plot(shots, original_conf, label='Original confidence', marker='o', color='r')
+    ax4.plot(shots, calibrated_conf, label='Calibrated confidence', marker='o', color='g')
+    ax4.plot(shots, static_temp_calibrated_conf, label='ST calib confidence', marker='o', color='b')
+    ax4.plot(shots, calibration_data.accuracies, label='Accuracies', marker='s', color='black')
+    
+    ax4.set_xlabel('Shots', fontsize=12)
+    ax4.set_ylabel('Accuracy/Confidence', fontsize=12)
+    ax4.set_title('Accuracies and confidence means', fontsize=12)
+    ax4.legend()
     
     plt.tight_layout()
     

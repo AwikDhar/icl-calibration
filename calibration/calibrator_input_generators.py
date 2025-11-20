@@ -162,3 +162,7 @@ def generate_data_class_agnostic(params: Dict, sentences: List[str], embeddings:
     # print(probs, sentences, labels)
     # exit()
     return data
+
+# def generate_data_class_agnostic_with_embeddings(params: Dict, sentences: List[str], embeddings: np.ndarray, labels: List[int]):
+#     data = generate_data_class_agnostic(params, sentences, embeddings, labels)
+#     data['inputs'] = 
