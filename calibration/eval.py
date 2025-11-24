@@ -17,7 +17,7 @@ from plot_results.plot_tc import plot_calibration
 def main(models, datasets, feature_type, shots_start, sampling_strategy = None, gpu_id=0, model_path=None, llm_agnostic=False, save_path=None):
     device = f'cuda:{gpu_id}'
     
-    data = load_datasets(models, datasets, device, feature_type, splits=('test','train'), sampling_strategy=sampling_strategy, temp_augment=True)
+    data = load_datasets(models, datasets, device, feature_type, splits=('test','train'), sampling_strategy=sampling_strategy, temp_augment=False)
     
     with open(f"calibration/models/transformer_config.json", 'r') as file:
         config = json.load(file)
@@ -74,8 +74,30 @@ def eval(model, data, llm, dataset, shots_start, device):
     model.eval()
     with torch.no_grad():
         inputs, logits, labels = get_batch(data[llm][dataset]['test'], batch_size=None, device=device) # len(eval),T,C | len(eval),T,num_classes | len(eval),T
+        num_classes = logits.shape[-1]
         
-        temperatures = model(inputs) # B,T,1
+        pred_classes = logits.argmax(dim=-1)  # B, T
+                
+        calibrated_pred_probs = model(inputs) # B,T,1
+        calibrated_pred_probs = torch.clamp(calibrated_pred_probs, min=1/num_classes + 2e-2, max = 1.0 - 2e-2)
+        
+        remaining_prob_mass = 1.0 - calibrated_pred_probs # Shape: B, T, 1
+        remaining_prob_per_class = remaining_prob_mass / (num_classes - 1) 
+        
+        # 4. Concatenate: [P'_max | P'_other, P'_other, ...]
+        # Initialize all probabilities to the uniform remaining probability
+        # calibrated_probs = remaining_prob_per_class.repeat(1, 1, num_classes) # Shape: B, T, num_classes
+        
+        # # Set the predicted class to the calibrated probability
+        # calibrated_probs.scatter_(dim=-1, index=pred_classes.unsqueeze(-1), 
+        #                         src=calibrated_pred_probs)
+        
+        # calibrated_logits = torch.log(calibrated_probs)
+                
+        
+        temperatures = get_equivalent_temp(logits, calibrated_pred_probs)  # B, T, 1
+        # calibrated_probs = torch.softmax(logits * temperatures, dim=-1)
+        # temperatures = calibrated_logits/logits # B,T,1
         temperatures = torch.nan_to_num(temperatures, nan=1.0)
 
         calibrated_logits = logits*temperatures # B,T,num_classes * B,T,1
@@ -159,6 +181,34 @@ def tune_temp(logits, labels, lower=0.01, upper=5.0, eps=0.00001):
         
     t = min([lower, 0.5 * (lower + upper), upper], key=lambda x: float(F.cross_entropy(logits * x, labels)))
     return t
+
+# def get_equivalent_temp(logits: torch.tensor, calibrated_prob: float, eps=1e-5):
+#     lower, upper = 0.01, 5
+    
+#     get_prob_gap = lambda args : abs(F.softmax(args[0], dim=-1).max() - args[1])
+#     while get_prob_gap > eps:
+#         mid = (lower+upper)/2
+        
+def get_equivalent_temp(logits, calibrated_pred_probs, num_iters=20):
+    """Binary search for T such that softmax(logits/T).max() = target_max_prob"""
+    B, T_seq, C = logits.shape
+    target_log_prob = torch.log(calibrated_pred_probs)  # B, T_seq, 1
+    
+    T_low = torch.ones(B, T_seq, 1, device=logits.device) * 0.01
+    T_high = torch.ones(B, T_seq, 1, device=logits.device) * 100.0
+    
+    for _ in range(num_iters):
+        T_mid = (T_low + T_high) / 2
+        scaled_logits = logits * T_mid
+        log_probs = scaled_logits - scaled_logits.logsumexp(dim=-1, keepdim=True)
+        current_max_log_prob = log_probs.max(dim=-1, keepdim=True).values
+        
+        # If current max prob is too high, T is too low (need to flatten more)
+        T_high = torch.where(current_max_log_prob > target_log_prob, T_mid, T_high)
+        T_low = torch.where(current_max_log_prob <= target_log_prob, T_mid, T_low)
+    
+    return (T_low + T_high) / 2
+        
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()

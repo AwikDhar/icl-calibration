@@ -3,6 +3,7 @@ import os
 import pickle
 from calibration_plot_data import CalibrationPlotData
 import matplotlib.pyplot as plt
+import seaborn as sns
 import numpy as np
 import relplot
 
@@ -15,6 +16,7 @@ def plot_calibration(
         sampling_strategy: str = None,
         save_path=None
     ):
+    sns.set_style("whitegrid")
 
     shots = sorted(list(calibration_data.ece_shots_map['original'].keys()))
 
@@ -56,12 +58,13 @@ def plot_calibration(
     temps = [calibration_data.temp_shots_map[shot] for shot in shots]
     static_temps = [calibration_data.static_temp_shots_map[shot] for shot in shots]
     
-    ax3.boxplot(temps, positions=shots)
+    ax3.boxplot(temps, positions=shots, showfliers=False)
     ax3.plot(shots, static_temps, label='Static Temp', marker='x', color='b', linestyle='--')
     
     ax3.set_xlabel('Shots', fontsize=12)
     ax3.set_ylabel('Temperature ranges', fontsize=12)
     ax3.set_title(f'Calibration temperatures', fontsize=12)
+    # ax3.set_ylim([0, 1.5])
     ax3.legend()
     
     # Accuracy/Confidence plot

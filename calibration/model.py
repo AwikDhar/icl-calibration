@@ -7,10 +7,10 @@ class CalibrationTransformer(nn.Module):
             self, 
             in_features, 
             context_length=10,
-            embedding_dim=128,
+            embedding_dim=32,
             num_heads=8,
             num_layers=4,
-            dropout=0.1
+            dropout=0.2
         ):
         super().__init__()
 
@@ -36,6 +36,8 @@ class CalibrationTransformer(nn.Module):
         inputs = self.embedding(inputs) + self.pos_embedding(positions)
         out = self.transformer_encoder(inputs, mask=self.causal_mask[:T, :T], is_causal=True)
         out = self.lm_head(out)
+        out = F.sigmoid(out)
+        
         # out = 0.2 + 1.8*F.sigmoid(out)
         
         return out

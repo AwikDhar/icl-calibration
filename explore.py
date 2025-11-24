@@ -12,16 +12,17 @@ import torch
 model = 'Qwen/Qwen3-8B'# # 'openai/gpt-oss-20b' 'Qwen/Qwen3-8B'
 # model = 'openai/gpt-oss-20b'
 # model = 'meta-llama/Llama-3.1-8B-Instruct'
-datasets = ['sst5', 'snli', 'trec', 'rte', 'agnews', 'goemotions', 'dbpedia_l2', 'toxic_chat', 'newsgroups']
+datasets = []#['sst5', 'snli', 'trec', 'rte', 'agnews', 'goemotions', 'dbpedia_l2', 'toxic_chat', 'newsgroups']
 
-split = 'test'
-# split = 'train'
+# split = 'test'
+split = 'train'
 
-if split == 'test':
+if 1 or split == 'test':
     datasets += ['commonsense_qa', 'qqp', 'banking77', 'metatool', 'wildguard', 'when2call', 'wikitoxic', 'amazon_counterfactual', 'massive_intent', 'dbpedia_l1']
 # datasets = ['metatool', 'dbpedia_l1' 'amazon_counterfactual', 'massive_intent', 'wildguard', 'commonsense_qa', 'qqp']
 # print(os)
 # icl-calibration/calibration/datasets/meta-llama_Llama-3.1-8B-Instruct/commonsense_qa
+print(model)
 for idx, dataset in enumerate(datasets):
     print(f'\n{idx+1}. '+dataset + ': ')
     # for split in ('train', ):
@@ -36,7 +37,7 @@ for idx, dataset in enumerate(datasets):
             if abs(ratio-0.5)>0.1:
                 print(f' Imbalanced {split} split: {sim_count/len(data)}')
     except Exception as e:
-        print(e)
+        print(type(e).__name__, e)
     # print('-----------')
         # exit()
 # with open(f"calibration/datasets/{model.replace('/','_')}/{dataset}/{split}.json", 'w') as file:

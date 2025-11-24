@@ -237,7 +237,7 @@ def get_similarities(test_embeddings: np.ndarray, sentence_embeddings: np.ndarra
     similarities = np.dot(test_embeddings, sentence_embeddings.T)
     return similarities
 
-def setup_model(model_name, gpu_id_=0):
+def setup_model(model_name, num_log_probs = 1000, gpu_id_=0):
     global infer_model
     global infer_tokenizer
     global gpu_id
@@ -259,16 +259,16 @@ def setup_model(model_name, gpu_id_=0):
                 model=model_name,
                 # tensor_parallel_size=2,
                 max_model_len=30000,
-                # quantization='fp8',
+                quantization='fp8',
                 seed=42,
                 # enable_chunked_prefill=False,  # Disable chunked prefill
                 max_num_seqs=1,  # Force sequential processing
                 # enable_prefix_caching=False,
                 # enforce_eager=True,
                 limit_mm_per_prompt={"image": 0}, # to skip initialization of vision tower of multimodel models
-                max_logprobs=1000,
+                max_logprobs=num_log_probs,
                 download_dir=cache_dir,
-                gpu_memory_utilization=0.95
+                gpu_memory_utilization=0.90
             )
             del os.environ['CUDA_VISIBLE_DEVICES']
             logger.info(f"Loaded {model_name} via vllm")
@@ -691,7 +691,7 @@ def populate_trie_recursive(prompt_prefix, path, label_trie, params):
         
 def get_results(params, train_sentences, train_labels, test_sentences):
     """Get results for multi-token labels"""
-    setup_model(params['model'], gpu_id_=params['gpu_id'])
+    setup_model(params['model'], params['api_num_log_prob'], gpu_id_=params['gpu_id'])
 
     all_label_probs = []
     all_label_raw_logits = []    # will be filled with logprobs 
