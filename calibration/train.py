@@ -17,7 +17,7 @@ from losses import BrierLoss
 from utils import convert_to_list
 from metrics import Metrics
 
-def recalculate_features(item: Dict, temp_augment=False):
+def recalculate_features(item: Dict, temp_augment=False, label_augment=False):
     # print(item['inputs'])
 
     # recalculate = torch.empty(1).uniform_(0,1).item()>0.7 # 30 # chance of recalculating features
@@ -26,50 +26,74 @@ def recalculate_features(item: Dict, temp_augment=False):
 
     if temp_augment:
         apply_temp_augmentation(item)    
+        
+        T, num_classes = item['logits'].shape
+        probs = F.softmax(item['logits'], dim=-1)
+            
+        pred_probs = probs.max(dim=-1).values
+        normalized_entropies = -(probs@torch.log(probs.T + 1e-9)).diagonal() / torch.log(torch.tensor(num_classes)) # (B, num_classes) × (num_classes, B) --> (B, B) --> diagonal elements
+
+        item['inputs'][:,0] = pred_probs    
+        item['inputs'][:,3] = normalized_entropies
+    
+    if label_augment:
+        apply_label_augmentation(item)  
+        item['inputs'][1:, 1] = (item['logits'][:-1].argmax(dim = -1) == item['labels'][:-1]).float()
+
+    if temp_augment or label_augment:  
+        shifted_gt_probs = torch.concatenate((
+            torch.tensor([0.5]), 
+            probs[torch.arange(T-1), item['labels'][:-1]]
+        )) # exclude last position and shift
+        
+        item['inputs'][:,2] = shifted_gt_probs
     
     brier_scores = torch.cat((torch.tensor([[0.5]]), (1 - item['inputs'][1:,[2]])**2), dim=0)
-    item['inputs'] = torch.cat((brier_scores, item['inputs'][:,:1], item['inputs'][:,4:]), dim=-1)
+    item['inputs'] = torch.cat((brier_scores, item['inputs'][:,:2], item['inputs'][:,4:]), dim=-1)
+    # print(item['inputs'])
+    # item['inputs'][:, 0] = torch.linspace(0.5, 1, len(item['inputs']))
+    # item['inputs'][:, 2] = 0
     
-    # T, C = item['inputs'].shape
-    # perturbed_shots = 7
-    # noise = torch.normal(mean=0.05, std=0.05, size=(perturbed_shots, C))
-    
-    # item['inputs'][:perturbed_shots,:] += noise
-
-    # probs = torch.softmax(item['logits'], dim=-1)
-    # pred_probs = torch.max(probs, dim=-1).values 
-    # probs = torch.stack((pred_probs, 1-pred_probs), dim=-1)
-    
-    # item['logits'] = torch.log(probs)
-    return 
     # print(item['inputs'])
     # exit()
+    # add_noise_to_features(item)
  
 def apply_temp_augmentation(item: Dict):
     item['inputs'][0][2] = -1
     mean_conf = item['inputs'][:, 0].mean()
-    # print(item['inputs'][:, 0], mean_conf); exit()
-    max_temp = 1.2 + max(0, 0.8*F.tanh( 2*(mean_conf-0.5) ))
+
+    max_temp = 1 + max(0, F.tanh( 4*(mean_conf-0.5) ))
     temp = torch.empty(1).uniform_(1,max_temp).item()
     item['logits'] /= temp
     
-    num_classes = item['logits'].shape[-1]
-    probs = F.softmax(item['logits'], dim=-1)
+def apply_label_augmentation(item: Dict):
+    mean_conf = item['inputs'][:, 0].mean()
+    max_temp = 1 + max(0.2, F.tanh( 4*(mean_conf-0.5) ))
+    temp = torch.empty(1).uniform_(1 ,max_temp).item()
+    logits = item['logits'] / temp
+    
+    probs = F.softmax(logits, dim=-1)
+    preds = torch.multinomial(probs, 1).squeeze(-1)
+    
+    item['labels'] = preds
         
-    preds = torch.argmax(probs, dim=-1)
-    pred_probs = probs[torch.arange(len(preds)), preds]
-    shifted_gt_probs = torch.concatenate((
-        torch.tensor([0.5]), 
-        probs[torch.arange(len(preds)-1), item['labels'][:-1]]
-    )) # exclude last position and shift
-
-    normalized_entropies = -(probs@torch.log(probs.T + 1e-9)).diagonal() / torch.log(torch.tensor(num_classes)) # (B, num_classes) × (num_classes, B) --> (B, B) --> diagonal elements
-
-    item['inputs'][:,0] = pred_probs
-    item['inputs'][:,2] = shifted_gt_probs
-    item['inputs'][:,3] = normalized_entropies
-        
-def load_datasets(models: List[str], datasets: list, device: str, feature_type: str, splits = ('train', 'test'), sampling_strategy = None, temp_augment: bool = False):
+def add_noise_to_features(item: Dict):
+    T, C = item['inputs'].shape
+    perturbed_shots = 7
+    noise = torch.normal(mean=1, std=5, size=(perturbed_shots, C))
+    
+    item['inputs'][:perturbed_shots,:] += noise
+    
+def load_datasets(
+        models: List[str], 
+        datasets: list, 
+        device: str, 
+        feature_type: str, 
+        splits = ('train', 'test'),
+        sampling_strategy = None,
+        temp_augment: bool = False,
+        label_augment: bool = False
+    ):
     """Preload all datasets into GPU memory for fast training (with optional feature recalculation)."""
     data = {}
 
@@ -91,7 +115,7 @@ def load_datasets(models: List[str], datasets: list, device: str, feature_type: 
                     split_data[idx]["labels"] = torch.tensor(split_data[idx]["labels"], dtype=torch.long)
 
                     # if temp_augment:
-                    recalculate_features(split_data[idx], temp_augment=temp_augment)
+                    recalculate_features(split_data[idx], temp_augment=temp_augment, label_augment=label_augment)
 
                 # batchify entire dataset
                 inputs_all = torch.stack([item["inputs"] for item in split_data])
@@ -115,6 +139,7 @@ def main(models: List[str],
          eval_iter: int,
          batch_size: int,
          temp_augment: bool,
+         label_augment: bool,
          feature_type: str,
          sampling_strategy:str,
          resume_saved_ckpt: bool,
@@ -140,7 +165,7 @@ def main(models: List[str],
     
     device = f'cuda:{gpu_id}'
     
-    data = load_datasets(models, datasets, device, feature_type, temp_augment=temp_augment, sampling_strategy=sampling_strategy)
+    data = load_datasets(models, datasets, device, feature_type, temp_augment=temp_augment, label_augment=label_augment, sampling_strategy=sampling_strategy)
                 
     model_dir = f"./calibration/models/"+ (models[0].replace('/','_') if len(models)==1 else 'llm_agnostic')
     model_path = f'{model_dir}/calibrator'  
@@ -175,7 +200,20 @@ def main(models: List[str],
     calibrator = torch.compile(calibrator, fullgraph=True, dynamic=False, mode="max-autotune")
     
     # print(model_path); exit()
-    train(calibrator, data, datasets_dropout, iterations, lr, eval_iter, batch_size, device, model_path, metrics_path, resume_saved_ckpt, shots_start)
+    train(
+        calibrator, 
+        data,
+        datasets_dropout,
+        iterations,
+        lr,
+        eval_iter,
+        batch_size,
+        device,
+        model_path,
+        metrics_path,
+        resume_saved_ckpt, 
+        shots_start
+    )
 
 def train(model: nn.Module, 
           data: Dict, 
@@ -195,7 +233,7 @@ def train(model: nn.Module,
         model (nn.Module): the calibrator
         data (Dict): dataset dict
         datasets_dropout (float): _description_
-        iterations (int): _description_
+        iterations (int): number of training iterations
         lr (float): learning rate
         eval_iter (int): _description_
         batch_size (int): training abtch size
@@ -204,7 +242,7 @@ def train(model: nn.Module,
         metrics_path (str): path to save ckpt's eval metrics
         resume_saved_ckpt (bool): whether to resume training from saved best ckpt
         gpu_id (int): GPU id to keep all GPU operations on
-        shots_start (int): what shots onwards to consider loss for backprop(earlier ones will be ignored for loss) 
+        shots_start (int): what shots onwards to consider loss for backprop(earlier ones will be ignored for loss calculation) 
     """    
     if resume_saved_ckpt and os.path.exists(metrics_path):
         with open(metrics_path, 'r') as file:
@@ -219,7 +257,7 @@ def train(model: nn.Module,
     
     improved = False
     
-    temp_lambda = 0.5
+    # temp_lambda = 0.5
     
     optimizer = torch.optim.AdamW(model.parameters(), weight_decay=0.05)
     # optimizer = torch.optim.SGD(model.parameters(), lr=lr, momentum=0.9, weight_decay=1e-4)
@@ -235,8 +273,8 @@ def train(model: nn.Module,
     
     grad_history = deque(maxlen=40000)
     
-    model.train()
     for iter in tqdm(range(iterations), desc='Training calibrator'):
+        model.train()
         optimizer.zero_grad(set_to_none=True)
         
         total_loss = 0
@@ -247,43 +285,46 @@ def train(model: nn.Module,
         
         for (llm, dataset) in active_datasets:
             inputs, logits, labels = get_batch(data[llm][dataset]['train'], batch_size, device) # B,T,C
+            correctness_labels = (logits.argmax(dim=-1)==labels).float()
+            
             num_classes = logits.shape[-1]
             
-            with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
-                pred_probs, pred_classes = logits.max(dim=-1)  # B, T
-                
-                calibrated_pred_probs = model(inputs) # B,T,1
-                calibrated_pred_probs = torch.clamp(calibrated_pred_probs, min=1/num_classes + 0.01, max = 0.99)
-                
-                remaining_prob_mass = 1.0 - calibrated_pred_probs # Shape: B, T, 1
-                remaining_prob_per_class = remaining_prob_mass / (num_classes - 1) 
-                
-                # 4. Concatenate: [P'_max | P'_other, P'_other, ...]
-                # Initialize all probabilities to the uniform remaining probability
-                calibrated_probs = remaining_prob_per_class.repeat(1, 1, num_classes) # Shape: B, T, num_classes
-                
-                # Set the predicted class to the calibrated probability
-                calibrated_probs.scatter_(dim=-1, index=pred_classes.unsqueeze(-1), 
-                                        src=calibrated_pred_probs)
-                
-                calibrated_logits = torch.log(calibrated_probs + 1e-4)
-                temperatures = calibrated_logits/logits
-                # calibrated_logits = logits*temperatures # B,T,num_classes
+            # with torch.amp.autocast(device_type='cuda', dtype=torch.bfloat16):
+            pred_probs, pred_classes = logits.max(dim=-1)  # B, T
+            
+            calibrated_pred_probs = model(inputs) # B,T,1
+            
+            B,T,num_classes = logits.shape
+            loss = F.binary_cross_entropy(calibrated_pred_probs[:,shots_start:].reshape(B*(T-shots_start)), correctness_labels[:,shots_start:].reshape(B*(T-shots_start)))
+            
+            calibrated_pred_probs = torch.clamp(calibrated_pred_probs, min=1/num_classes + 0.01, max = 0.99)
+            remaining_prob_mass = 1.0 - calibrated_pred_probs # Shape: B, T, 1
+            remaining_prob_per_class = remaining_prob_mass / (num_classes - 1) 
+            
+            # 4. Concatenate: [P'_max | P'_other, P'_other, ...]
+            # Initialize all probabilities to the uniform remaining probability
+            calibrated_probs = remaining_prob_per_class.repeat(1, 1, num_classes) # Shape: B, T, num_classes
+            
+            # Set the predicted class to the calibrated probability
+            calibrated_probs.scatter_(dim=-1, index=pred_classes.unsqueeze(-1), 
+                                    src=calibrated_pred_probs)
+            
+            calibrated_logits = torch.log(calibrated_probs + 1e-4)
+            # calibrated_logits = logits*temperatures # B,T,num_classes
 
-                B,T,num_classes = calibrated_logits.shape
-                loss = F.cross_entropy(calibrated_logits[:,shots_start:,:].reshape(B*(T-shots_start), num_classes), 
-                                       labels[:,shots_start:].reshape(B*(T-shots_start)))
-                # ce_loss = F.cross_entropy(calibrated_logits[:,shots_start:,:].reshape(B*(T-shots_start), num_classes), 
-                #                        labels[:,shots_start:].reshape(B*(T-shots_start)), reduction='none') # important to add reduction='none' to keep per-batch-item loss
-                # pt = torch.exp(-ce_loss)
-                # loss = ((1-pt)**2 * ce_loss).mean() # focal loss
-                # loss = sigmoid_focal_loss(calibrated_logits[:,shots_start:,:].reshape(B*(T-shots_start), num_classes), 
-                #                        labels[:,shots_start:].reshape(B*(T-shots_start)))
-                # print(calibrated_pred_probs.shape, pred_probs.shape)
-                # temp_regularization_loss = torch.mean((calibrated_pred_probs.squeeze(-1)-pred_probs)**2) #torch.mean((temperatures-1.0)**2)
-                
-                total_loss += loss #+ temp_lambda * temp_regularization_loss
-                # total_loss += brier_loss(calibrated_logits, labels) #+ temp_lambda*temp_regularizar_loss
+            # loss = F.cross_entropy(calibrated_logits[:,shots_start:,:].reshape(B*(T-shots_start), num_classes), 
+            #                        labels[:,shots_start:].reshape(B*(T-shots_start)))
+            # ce_loss = F.cross_entropy(calibrated_logits[:,shots_start:,:].reshape(B*(T-shots_start), num_classes), 
+            #                        labels[:,shots_start:].reshape(B*(T-shots_start)), reduction='none') # important to add reduction='none' to keep per-batch-item loss
+            # pt = torch.exp(-ce_loss)
+            # loss = ((1-pt)**2 * ce_loss).mean() # focal loss
+            # loss = sigmoid_focal_loss(calibrated_logits[:,shots_start:,:].reshape(B*(T-shots_start), num_classes), 
+            #                        labels[:,shots_start:].reshape(B*(T-shots_start)))
+            # print(calibrated_pred_probs.shape, pred_probs.shape)
+            # temp_regularization_loss = torch.mean((calibrated_pred_probs.squeeze(-1)-pred_probs)**2) #torch.mean((temperatures-1.0)**2)
+            
+            total_loss += loss #+ temp_lambda * temp_regularization_loss
+            # total_loss += brier_loss(calibrated_logits, labels) #+ temp_lambda*temp_regularizar_loss
                             
             if (iter+1)%eval_iter==0:
                 with torch.inference_mode():
@@ -361,7 +402,7 @@ def eval(model, data, shots_start, batch_size, device):
                 pred_classes = logits.argmax(dim=-1)  # B, T
                 
                 calibrated_pred_probs = model(inputs) # B,T,1
-                calibrated_pred_probs = torch.clamp(calibrated_pred_probs, min=1/num_classes + 2e-2, max = 1.0 - 2e-2)
+                calibrated_pred_probs = torch.clamp(calibrated_pred_probs, min=1/num_classes + 0.01, max = 0.99)
                 
                 remaining_prob_mass = 1.0 - calibrated_pred_probs # Shape: B, T, 1
                 remaining_prob_per_class = remaining_prob_mass / (num_classes - 1) 
@@ -435,6 +476,8 @@ if __name__ == '__main__':
     parser.add_argument('--shots_start', dest='shots_start', action='store', required=False, type=int, default=2, help='which shot # onwards we will do calibration for training and eval')
     parser.add_argument('--temp_augment', dest='temp_augment', action='store_const', const=True, default=False,
                         help="Whether or not to randomly temperature scale data logits(and affect features) for robust training")
+    parser.add_argument('--label_augment', dest='label_augment', action='store_const', const=True, default=False,
+                        help="Whether or not to randomly sample synthetic labels from a temp scaled prob distribution for accuracy variation/robust training")
     
     # general training args
     parser.add_argument('--iterations', dest='iterations', action='store', required=False, type=int, default=20000 , help='number of iterations for training')

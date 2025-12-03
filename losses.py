@@ -70,13 +70,20 @@ class ECELoss(nn.Module):
     
 def brier_score(logits, labels):
     probs = F.softmax(logits, dim=-1)
-    labels_one_hot = torch.zeros_like(probs)
-    # print(labels_one_hot.shape, labels.shape, logits.shape); exit()
-    labels_one_hot[torch.arange(len(labels)), labels] = 1
+    labels_one_hot = F.one_hot(labels, num_classes=probs.shape[-1]).float()
     
-    loss = torch.mean((probs-labels_one_hot)**2)
+    loss = torch.mean(torch.sum((probs-labels_one_hot)**2, dim=-1))
     
     return loss
+
+# def brier_score(logits, labels):
+#     # prediction probs
+#     probs = F.softmax(logits, dim=-1)
+#     # ground truth probs
+#     gt_probs = probs[torch.arange(len(labels)), labels]
+    
+#     loss = torch.mean((1.0-gt_probs)**2)
+#     return loss
 
 def smooth_ece(logits, labels, prepare_rel_diag=False):
     conf, acc = relplot.multiclass_logits_to_confidences(logits, labels) # reduce to binary setting

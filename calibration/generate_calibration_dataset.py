@@ -29,17 +29,17 @@ logger.addHandler(consoleHandler)
 
 logger.setLevel(logging.INFO)
 
-SAVE_DIR_TMP = 'calibration/datasets'
-os.makedirs(SAVE_DIR_TMP, exist_ok=True)
+SAVE_DIR = 'calibration/datasets'
+os.makedirs(SAVE_DIR, exist_ok=True)
 
 def save_dataset(params, generated_dataset):
-    save_path = os.path.join(SAVE_DIR_TMP, params['model'].replace('/','_'), params['dataset'], "class_agnostic") # '/' in HF model id
+    save_path = os.path.join(SAVE_DIR, params['model'].replace('/','_'), params['dataset']) # '/' in HF model id
     os.makedirs(save_path, exist_ok=True)
     
     for split in ('train', 'test'):
         data = generated_dataset[split]
         if not data:
-            logger.warning("Empty split data, skipping saving/overwriting.")
+            logger.warning("Empty split data, not saving or overwriting.")
             continue
         
         file_name = os.path.join(save_path, f'{split}.json')
@@ -104,12 +104,12 @@ def generate_calibration_datasets(params_list: List[Dict], datasets: Dict, calib
     """
 
     for params in tqdm(params_list, total=len(params_list), desc="Processing experiments"):
-        file_name = os.path.join(SAVE_DIR_TMP, f"{params['generated_dataset_name'].replace('/','_')}.pkl")
+        file_name = os.path.join(SAVE_DIR, f"{params['generated_dataset_name'].replace('/','_')}.pkl")
         if os.path.isfile(file_name):
             logging.info("Skipping experiment, already done before.")
             continue
         logger.info(params)
-        logger.info("\Dataset to be generated: %s", params['generated_dataset_name'])
+        logger.info("Dataset to be generated: %s", params['generated_dataset_name'])
         
         ### load data
         start = time()
@@ -134,7 +134,7 @@ def generate_calibration_datasets(params_list: List[Dict], datasets: Dict, calib
             'test': [all_test_sentences, all_test_embeddings, all_test_labels]
         }
 
-        data_generation_fn = generate_data_class_agnostic
+        data_generation_fn = generate_data_class_agnostic_with_embeddings
         for split in ('train', 'test'):
             all_sentences, all_embeddings, all_labels = icl_data[split]
             for iter in tqdm(range(params[f'{split}_size']), desc=f'Generating {split} split'):
@@ -170,19 +170,24 @@ def args_check(args: Dict):
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
+    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
     # mp.set_start_method('spawn', force=True)
     # setup_single_threading()
     setup_vllm_env_settings()
-    # required arguments
+
     parser.add_argument('--model', dest='models', action='store', required=True, help='name of model(s), e.g., GPT2-XL')
     parser.add_argument('--datasets', dest='datasets', action='store', required=True, help='name of dataset(s), e.g., agnews')
     parser.add_argument('--num_shots', dest='num_shots', action='store', required=True, help='num training examples to use', type=int)
     parser.add_argument('--train_size', dest='train_size', action='store', required=True, type=int,
-                            default=10000, help='how big of a trian dataset you want to generate')
+                            default=5000, help='how big of a trian dataset you want to generate')
     parser.add_argument('--test_size', dest='test_size', action='store', required=True, type=int,
                             default=2000, help='how big of a test dataset you want to generate')
     parser.add_argument('--append_data', dest='append_data', action='store_const', required=False, const=True, default=False,
                             help='append to existing dataset if True, overwrite otherwise')
+    parser.add_argument('--embedding_model', dest='embedding_model', action='store', required=False, default='google/embeddinggemma-300m',
+                            help='append to existing dataset if True, overwrite otherwise')
+    parser.add_argument('--embedding_dim', dest='embedding_dim', action='store', required=False, default=128, help='embedding dim if using Matryoshka trained model', type=int)
+    
     parser.add_argument('--api_num_log_prob', dest='api_num_log_prob', action='store', required=False, type=int,
                         default=100, help='number of top tokens to ask for when querying the model. Capped at 100 for OpenAI GPT-3 API')
     parser.add_argument('--bs', dest='bs', action='store', required=False, type=int, default=None,

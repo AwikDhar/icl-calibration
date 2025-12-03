@@ -6,11 +6,14 @@ import os
 import torch
 import pickle
 import random
-from transformers import AutoTokenizer, AutoModelForCausalLM, EetqConfig
 from typing import Callable, List, Dict
 from collections import Counter
-import torch
+
 from vllm import LLM, SamplingParams
+from transformers import AutoTokenizer, AutoModelForCausalLM, EetqConfig
+import torch
+from sentence_transformers import SentenceTransformer
+
 from calibration.model import CalibrationTransformer
 from labels_trie import LabelsTrie
 
@@ -33,6 +36,7 @@ compile = False
 infer_tokenizer = None
 calibrator = None
 gpu_id = None
+embedding_model = None
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
@@ -218,7 +222,9 @@ def similarity_sampling(
     if shuffle:
         for idx_row in top_idxs:
             np.random.shuffle(idx_row)
-            
+    else:
+        top_idxs = np.flip(top_idxs, axis=-1) # the test sentence stays at the last position instead of 1st
+        
     sampled_data = SampledData()
     sampled_data.sentences = [[sentences[j] for j in idx_row] for idx_row in top_idxs]
     sampled_data.labels = [[labels[j] for j in idx_row] for idx_row in top_idxs]
@@ -237,7 +243,55 @@ def get_similarities(test_embeddings: np.ndarray, sentence_embeddings: np.ndarra
     similarities = np.dot(test_embeddings, sentence_embeddings.T)
     return similarities
 
-def setup_model(model_name, num_log_probs = 1000, gpu_id_=0):
+def setup_embedding_model(params: Dict):
+    global embedding_model
+    global gpu_id
+    
+    if embedding_model is None:
+        embedding_model = SentenceTransformer(f"{params['embedding_model']}", device=f'cuda:{gpu_id}', truncate_dim=params['embedding_dim'], cache_folder=os.environ['HF_HOME'], model_kwargs={'torch_dtype':torch.bfloat16})
+    
+# Get embeddings of sentences at a specified truncated dim. 
+# Full embeddings for similarity sampling, truncated embeddings for calibrator features for easier learning 
+def get_embeddings(params: Dict, sentences: List[str]):
+    global embedding_model
+    
+    setup_embedding_model(params)
+    with torch.inference_mode():
+        sentences_embeddings = embedding_model.encode(sentences, show_progress_bar=False, convert_to_numpy=True) 
+        
+    return sentences_embeddings
+
+def normalize_distribution(p, epsilon=1e-9):
+    """
+    Normalize array to valid probability distribution.
+    """
+    p = np.asarray(p) + epsilon
+    return p / np.sum(p)
+
+
+def kl_divergence(p, q, epsilon=1e-9):
+    """
+    Compute KL divergence D_KL(P || Q).
+    """
+    p = normalize_distribution(p, epsilon)
+    q = normalize_distribution(q, epsilon)
+    
+    return np.sum(p * np.log(p / q))
+
+
+def js_divergence(p, q, epsilon=1e-9):
+    """
+    Compute Jensen-Shannon divergence between two probability distributions.
+    """
+    p = normalize_distribution(p, epsilon)
+    q = normalize_distribution(q, epsilon)
+    
+    m = 0.5 * (p + q)
+    
+    return 0.5 * kl_divergence(p, m) + 0.5 * kl_divergence(q, m)
+
+
+def setup_llm(model_name, num_log_probs = 1000, gpu_id_=0):
     global infer_model
     global infer_tokenizer
     global gpu_id
@@ -258,8 +312,8 @@ def setup_model(model_name, num_log_probs = 1000, gpu_id_=0):
             infer_model = LLM(
                 model=model_name,
                 # tensor_parallel_size=2,
-                max_model_len=30000,
-                quantization='fp8',
+                max_model_len=40000,
+                # quantization='fp8',
                 seed=42,
                 # enable_chunked_prefill=False,  # Disable chunked prefill
                 max_num_seqs=1,  # Force sequential processing
@@ -268,7 +322,7 @@ def setup_model(model_name, num_log_probs = 1000, gpu_id_=0):
                 limit_mm_per_prompt={"image": 0}, # to skip initialization of vision tower of multimodel models
                 max_logprobs=num_log_probs,
                 download_dir=cache_dir,
-                gpu_memory_utilization=0.90
+                gpu_memory_utilization=0.85
             )
             del os.environ['CUDA_VISIBLE_DEVICES']
             logger.info(f"Loaded {model_name} via vllm")
@@ -321,7 +375,7 @@ def setup_model(model_name, num_log_probs = 1000, gpu_id_=0):
 
         logger.info("Finished loading model")
         
-    return infer_model, infer_tokenizer
+    # return infer_model, infer_tokenizer
 
 def setup_calibrator(params):
     global calibrator
@@ -374,7 +428,7 @@ def transformer_calibrate(params:Dict, data: Dict):
         
         return calibrated_logits[:,-1,:].cpu()        
 
-def complete_generation_opt(prompts, num_log_probs=None):
+def complete_generation_hf(prompts, num_log_probs=None):
     ''' This function runs GPT-2 locally but places the outputs into an json that looks just like the one
      provided by the OpenAI API. '''
     global gpu_id
@@ -602,7 +656,7 @@ def complete(prompt, temp=0, num_log_probs=None):
     if use_vllm:
         return complete_generation_vllm(prompt, num_log_probs=num_log_probs)
     else:
-        return complete_generation_opt(prompt, num_log_probs=num_log_probs)
+        return complete_generation_hf(prompt, num_log_probs=num_log_probs)
 
 def construct_prompt(params, train_sentences, train_labels, test_sentence):
     global infer_tokenizer
@@ -691,7 +745,7 @@ def populate_trie_recursive(prompt_prefix, path, label_trie, params):
         
 def get_results(params, train_sentences, train_labels, test_sentences):
     """Get results for multi-token labels"""
-    setup_model(params['model'], params['api_num_log_prob'], gpu_id_=params['gpu_id'])
+    setup_llm(params['model'], params['api_num_log_prob'], gpu_id_=params['gpu_id'])
 
     all_label_probs = []
     all_label_raw_logits = []    # will be filled with logprobs 
@@ -823,5 +877,5 @@ def setup_vllm_env_settings():
     # torch.use_deterministic_algorithms(True)  
     # torch.backends.cudnn.deterministic = True  
     # torch.backends.cudnn.benchmark = False     
-    torch.manual_seed(42)
-    torch.cuda.manual_seed_all(42)
+    # torch.manual_seed(42)
+    # torch.cuda.manual_seed_all(42)

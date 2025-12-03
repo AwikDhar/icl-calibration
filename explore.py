@@ -7,27 +7,30 @@ import glob
 import numpy as np
 import pandas as pd
 import torch
+from calibration.model import CalibrationTransformer
 
-
-model = 'Qwen/Qwen3-8B'# # 'openai/gpt-oss-20b' 'Qwen/Qwen3-8B'
+# print(torch.cuda.get_device_name(0), torch.cuda.get_device_name(1), torch.cuda.get_device_name(2), torch.cuda.get_device_name(3), torch.cuda.device_count()); exit()
+# calibrator = CalibrationTransformer(in_features=11)
+# print(f"{sum(p.numel() for p in calibrator.parameters())/10**6: .2f} M parameters"); exit()
+# model = 'Qwen/Qwen3-8B'# # 'openai/gpt-oss-20b' 'Qwen/Qwen3-8B'
 # model = 'openai/gpt-oss-20b'
-# model = 'meta-llama/Llama-3.1-8B-Instruct'
-datasets = []#['sst5', 'snli', 'trec', 'rte', 'agnews', 'goemotions', 'dbpedia_l2', 'toxic_chat', 'newsgroups']
+model = 'meta-llama/Llama-3.1-8B-Instruct'
+datasets = ['sst5', 'snli', 'trec', 'rte', 'agnews', 'goemotions', 'dbpedia_l2', 'toxic_chat', 'newsgroups']
 
 # split = 'test'
 split = 'train'
 
-if 1 or split == 'test':
+if split == 'test':
     datasets += ['commonsense_qa', 'qqp', 'banking77', 'metatool', 'wildguard', 'when2call', 'wikitoxic', 'amazon_counterfactual', 'massive_intent', 'dbpedia_l1']
 # datasets = ['metatool', 'dbpedia_l1' 'amazon_counterfactual', 'massive_intent', 'wildguard', 'commonsense_qa', 'qqp']
 # print(os)
 # icl-calibration/calibration/datasets/meta-llama_Llama-3.1-8B-Instruct/commonsense_qa
-print(model)
+print(f"|----{model}----|")
 for idx, dataset in enumerate(datasets):
     print(f'\n{idx+1}. '+dataset + ': ')
     # for split in ('train', ):
     try:
-        with open(f"calibration/datasets/{model.replace('/','_')}/{dataset}/class_agnostic/{split}.json") as file:
+        with open(f"calibration/datasets/{model.replace('/','_')}/{dataset}/{split}.json") as file:
             data = json.load(file)
             # if len(data)>1000:
             #     data = data[1000:]
