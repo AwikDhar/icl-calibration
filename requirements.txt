@@ -8,3 +8,4 @@ relplot==1.0.1
 tqdm==4.67.1
 transformers==4.55.2
 vllm==0.10.1.1
+orjson==3.11.4

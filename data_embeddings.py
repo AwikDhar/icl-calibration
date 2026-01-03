@@ -61,10 +61,10 @@ def create_dataset_with_embeddings(model:str, dataset:str, dim = None)->None:
     os.makedirs(data_dir, exist_ok=True)
     
     with open(f"{data_dir}/train.json", 'w') as f:
-        json.dump(train_data, f, indent=2)
+        json.dump(train_data, f)
 
     with open(f"{data_dir}/test.json", 'w') as f:
-        json.dump(test_data, f, indent=2)
+        json.dump(test_data, f)
 
     print(f"{time()-start: .2f}s to create the dataset {dataset} with {dim} dimensions")
 

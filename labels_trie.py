@@ -40,6 +40,8 @@ class LabelsTrie:
             token_variants = list(set(token_variants))
             
             # 64 bit precision is important to prevent overflow(inf)
+            # if not any([tk in token_logits for tk in token_variants]):
+            #     print(token_logits, token_variants)
             logit_variants = torch.tensor([token_logits.get(tk, float('-inf')) for tk in token_variants], dtype=torch.float64) 
             logit = torch.logsumexp(logit_variants, dim=0).cpu().numpy()
             # if token.lstrip() in token_logits:

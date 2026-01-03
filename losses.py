@@ -1,5 +1,3 @@
-import math
-
 import relplot
 import torch
 import torch.nn.functional as F
@@ -85,12 +83,12 @@ def brier_score(logits, labels):
 #     loss = torch.mean((1.0-gt_probs)**2)
 #     return loss
 
-def smooth_ece(logits, labels, prepare_rel_diag=False):
+def smooth_ece(logits, labels, prepare_rel_diag=False, plot_confidence_band=False):
     conf, acc = relplot.multiclass_logits_to_confidences(logits, labels) # reduce to binary setting
     ece = relplot.smECE(f=conf, y=acc) # compute smECE of confidence calibration
     if prepare_rel_diag:
         # fig, ax = relplot.rel_diagram(f=conf, y=acc)
-        diagram = relplot.prepare_rel_diagram(f=conf, y=acc)
+        diagram = relplot.prepare_rel_diagram(f=conf, y=acc, plot_confidence_band=plot_confidence_band)
         return ece, diagram
     return ece
 

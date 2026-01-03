@@ -1,12 +1,14 @@
-import re
 from typing import Dict, List
 import json
 
 import datasets
 from transformers import AutoTokenizer
-from utils import ROOT_DIR
+from utils import ROOT_DIR, get_llm_framework
 import numpy as np
+
 from labels_trie import LabelsTrie
+from llm_framework import LlmFramework
+from gemini.gemini_model import GeminiTokenizer
 
 def load_dataset_with_embeddings(dataset:str, split:str):
     sentences, labels, embeddings = [], [], []
@@ -25,12 +27,23 @@ def load_dataset_with_embeddings(dataset:str, split:str):
 
 def set_label_tokens(labels: List[str], params: Dict):
     params['label_dict'] = {}
-    tokenizer = AutoTokenizer.from_pretrained(params['model'])
+    llm_framework = get_llm_framework(params['model'])
     
+    match llm_framework:
+        case LlmFramework.GOOGLE:
+            tokenizer = GeminiTokenizer(params['model'])
+        case _:
+            tokenizer = AutoTokenizer.from_pretrained(params['model'])
+        
     for label_idx, label in enumerate(labels):
-        tokens = tokenizer.tokenize(" " + label.lstrip())
+        prefix = " " if llm_framework!=LlmFramework.GOOGLE else ""
+        tokens = tokenizer.tokenize(prefix + label.lstrip())
         # tokens = [token.replace("Ġ", " ").replace('▁',' ') for token in tokens]
-        tokens[0] = " " + tokens[0][1:]
+        
+        # With gemini, the completion usually doesn't begin with a space, presumably because it autompletes like "<Assistant>predicted_class" 
+        # and gives you the post "<Assistant>" completion, which doesn't have a space. So you first label token shouldn't have a leading space
+        if llm_framework!=LlmFramework.GOOGLE: 
+            tokens[0] = " " + tokens[0][1:]
         
         params['label_dict'][label_idx] = {
             "label":label,
@@ -304,3 +317,5 @@ def set_prompt_params(params: Dict):
 
     else:
         raise NotImplementedError
+    
+    assert (params["a_prefix"].rstrip()+" ")==params["a_prefix"] # ensure there is exactly a single space at the end

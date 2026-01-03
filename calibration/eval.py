@@ -1,43 +1,61 @@
 import argparse
 import json
-import os
-from typing import Dict
 
 import torch
 import torch.nn.functional as F
 import numpy as np
 
-from calibration.model import CalibrationTransformer
-from metrics import Metrics
-from calibration_plot_data import CalibrationPlotData
-from calibration.train import get_batch, load_datasets, convert_to_list
+# from data_utils import * # bad - bandaid solution for a circular import 
 from utils import convert_to_list
+from calibration.model import CalibrationTransformer, PositionEmbeddingType
+from metrics import CalibrationMetrics
+from calibration_plot_data import CalibrationPlotData
+from calibration.train import get_batch, load_datasets 
+from calibration.temperature import get_shotwise_dynamic_temperatures, get_shotwise_static_temperatures, get_equivalent_temp
 from plot_results.plot_tc import plot_calibration
 
-def main(models, datasets, feature_type, shots_start, sampling_strategy = None, gpu_id=0, model_path=None, llm_agnostic=False, save_path=None):
+def main(llms, 
+         datasets,
+         feature_type,
+         shots_start,
+         shots_end,
+         sampling_strategy = None,
+         gpu_id=0, 
+         model_name="calibrator",
+         model_path=None,
+         llm_agnostic=False,
+         save_path=None,
+         plot_results=False,
+         plot_confidence_band=False,
+         plot_gt_calibration=False):
+    
     device = f'cuda:{gpu_id}'
     
-    data = load_datasets(models, datasets, device, feature_type, splits=('test','train'), sampling_strategy=sampling_strategy, temp_augment=False)
+    data = load_datasets(llms, datasets, device, feature_type, shots_end, splits=('test','train'), sampling_strategy=sampling_strategy, temp_augment=False, label_augment=False)
     
     with open(f"calibration/models/transformer_config.json", 'r') as file:
         config = json.load(file)
     
     if model_path is None:
-        if llm_agnostic or len(models)>1:
+        if llm_agnostic or len(llms)>1:
             model_dir = f"./calibration/models/llm_agnostic"
         else:
-            model_dir = f"./calibration/models/{models[0].replace('/','_')}"
+            model_dir = f"./calibration/models/{llms[0].replace('/','_')}"
             
-        model_path = f'{model_dir}/calibrator'
+        # if sampling_strategy:
+        #     model_dir += f"/{sampling_strategy}"
+            
+        model_path = f'{model_dir}/{model_name}'
 
-    sample_model, sample_dataset = models[0], datasets[0]
+    sample_model, sample_dataset = llms[0], datasets[0]
     T, C = data[sample_model][sample_dataset]['test']['inputs'][0].shape
     calibrator = CalibrationTransformer(
-    in_features=C, 
+        in_features=C, 
         context_length=config['context_length'], 
         embedding_dim=config['embedding_dim'], 
         num_heads=config['num_heads'], 
-        num_layers=config['num_layers']
+        num_layers=config['num_layers'],
+        pos_embedding_type=PositionEmbeddingType.Sinusoidal
     ).to(device)
     # print(calibrator)
 
@@ -50,187 +68,228 @@ def main(models, datasets, feature_type, shots_start, sampling_strategy = None, 
             cleaned_state_dict[key] = value
 
     calibrator.load_state_dict(cleaned_state_dict)
+
+    llm_eval_summaries = []
     
-    dataset_eces = []
+    llm_eces,         llm_briers = [], []
+    llm_dynamic_eces, llm_dynamic_briers = [], []
+    llm_static_eces,  llm_static_briers = [], []
     
-    for llm in models:
-        for dataset in datasets:
-            calibration_data = eval(calibrator, data, llm, dataset, shots_start, device)
-            dataset_ece = calibration_data.overall_reldiag['calibrated']['ce']
-            
-            print("Overall ECE: ", dataset_ece)
-            dataset_eces.append(dataset_ece)        
-            # continue
-            plot_calibration(calibration_data, llm, dataset, feature_type, llm_agnostic, sampling_strategy, save_path=save_path)
-    
-    print("\n**Eval datasets average ECE: ", np.mean(dataset_eces), " **")
-    
-def eval(model, data, llm, dataset, shots_start, device):
-    calibration_data = CalibrationPlotData()
-    static_temp_calibration_data = CalibrationPlotData()
-    
-    shotwise_static_temps = get_shotwise_static_temperatures(data[llm][dataset]['train'], shots_start)
-    
-    model.eval()
-    with torch.no_grad():
-        inputs, logits, labels = get_batch(data[llm][dataset]['test'], batch_size=None, device=device) # len(eval),T,C | len(eval),T,num_classes | len(eval),T
-        num_classes = logits.shape[-1]
+    for llm in llms:
+        dataset_eces,         dataset_briers = [], []
+        dataset_dynamic_eces, dataset_dynamic_briers = [], []
+        dataset_static_eces,  dataset_static_briers = [], []
         
-        pred_classes = logits.argmax(dim=-1)  # B, T
-                
+        print(f"\n||-----Model: {llm}-----||\n")
+        for dataset in datasets:
+            calibration_data = eval(calibrator, data, llm, dataset, shots_start, 
+                                    plot_results, plot_confidence_band, plot_gt_calibration)
+            
+            dataset_eces.append(calibration_data.overall_ece['calibrated'])
+            dataset_briers.append(calibration_data.overall_brier['calibrated'])
+            dataset_dynamic_eces.append(calibration_data.overall_ece['dynamic_temp_calibrated'])
+            dataset_dynamic_briers.append(calibration_data.overall_brier['dynamic_temp_calibrated'])
+            dataset_static_eces.append(calibration_data.overall_ece['static_temp_calibrated'])
+            dataset_static_briers.append(calibration_data.overall_brier['static_temp_calibrated'])
+            
+            if plot_results:
+                plot_calibration(calibration_data, llm, dataset, 
+                                 feature_type, llm_agnostic, sampling_strategy, 
+                                 save_path=save_path, plot_gt_calibration=plot_gt_calibration)
+    
+        llm_eces.append(np.mean(dataset_eces))
+        llm_briers.append(np.mean(dataset_briers))
+        llm_dynamic_eces.append(np.mean(dataset_dynamic_eces))
+        llm_dynamic_briers.append(np.mean(dataset_dynamic_briers))
+        llm_static_eces.append(np.mean(dataset_static_eces))
+        llm_static_briers.append(np.mean(dataset_static_briers))
+        
+        llm_eval_summaries.append("\n" + "="*60)
+        llm_eval_summaries.append(f"\n{llm} EVALUATION METRICS SUMMARY\n")
+        llm_eval_summaries.append("="*60)
+        llm_eval_summaries.append("\n--- Transformer Calibrator ---")
+        llm_eval_summaries.append(get_stats_summary("Expected Calibration Error (ECE)", dataset_eces))
+        llm_eval_summaries.append(get_stats_summary("Brier Score", dataset_briers))
+        llm_eval_summaries.append("\n--- Dynamic Temperature Scaling ---")
+        llm_eval_summaries.append(get_stats_summary("Expected Calibration Error (ECE)", dataset_dynamic_eces))
+        llm_eval_summaries.append(get_stats_summary("Brier Score", dataset_dynamic_briers))
+        llm_eval_summaries.append("\n--- Static Temperature Scaling ---")
+        llm_eval_summaries.append(get_stats_summary("Expected Calibration Error (ECE)", dataset_static_eces))
+        llm_eval_summaries.append(get_stats_summary("Brier Score", dataset_static_briers))
+        llm_eval_summaries.append("\n\n")
+    
+    eval_summary = "".join(llm_eval_summaries)
+    print(eval_summary)
+    print("\n" + "="*60)
+    print(f"\n {model_name} OVERALL SUMMARY\n")
+    print("="*60)
+    print("\n--- Transformer Calibrator ---")
+    print(get_stats_summary("Expected Calibration Error (ECE)", llm_eces))
+    print(get_stats_summary("Brier Score", llm_briers))
+    print("\n--- Dynamic Temperature Scaling ---")
+    print(get_stats_summary("Expected Calibration Error (ECE)", llm_dynamic_eces))
+    print(get_stats_summary("Brier Score", llm_dynamic_briers))
+    print("\n--- Static Temperature Scaling ---")
+    print(get_stats_summary("Expected Calibration Error (ECE)", llm_static_eces))
+    print(get_stats_summary("Brier Score", llm_static_briers))
+        
+def eval(model, data, llm, dataset, shots_start, plot_results, plot_confidence_band, plot_gt_calibration):
+    calibration_data = CalibrationPlotData()
+
+    inputs, logits, labels = get_batch(data[llm][dataset]['test'], batch_size=None) # len(eval),T,C | len(eval),T,num_classes | len(eval),T
+    B,T,num_classes = logits.shape
+    
+    shotwise_dynamic_temps = get_shotwise_dynamic_temperatures(data[llm][dataset]['test'], shots_start)
+    shotwise_static_temps = get_shotwise_static_temperatures(data[llm][dataset]['train'], shots_start, batch_size=100)
+    # shotwise_static_temps = {shot:1 for shot in range(shots_start, T)}
+    if plot_gt_calibration:
+        with open("calibration/trained_temperature.json", "r") as file:
+            shotwise_global_temps = json.load(file)
+            shotwise_global_temps = {int(shot):temp for  shot, temp in shotwise_global_temps.items()}
+
+    calibrator_metrics = {}
+    dynamic_temp_metrics = {}
+    static_temp_metrics = {}
+    global_temp_metrics = {} if plot_gt_calibration else None
+
+    model.eval()
+    with torch.no_grad():                        
         calibrated_pred_probs = model(inputs) # B,T,1
         calibrated_pred_probs = torch.clamp(calibrated_pred_probs, min=1/num_classes + 2e-2, max = 1.0 - 2e-2)
         
-        remaining_prob_mass = 1.0 - calibrated_pred_probs # Shape: B, T, 1
-        remaining_prob_per_class = remaining_prob_mass / (num_classes - 1) 
-        
-        # 4. Concatenate: [P'_max | P'_other, P'_other, ...]
-        # Initialize all probabilities to the uniform remaining probability
-        # calibrated_probs = remaining_prob_per_class.repeat(1, 1, num_classes) # Shape: B, T, num_classes
-        
-        # # Set the predicted class to the calibrated probability
-        # calibrated_probs.scatter_(dim=-1, index=pred_classes.unsqueeze(-1), 
-        #                         src=calibrated_pred_probs)
-        
-        # calibrated_logits = torch.log(calibrated_probs)
-                
-        
         temperatures = get_equivalent_temp(logits, calibrated_pred_probs)  # B, T, 1
-        # calibrated_probs = torch.softmax(logits * temperatures, dim=-1)
-        # temperatures = calibrated_logits/logits # B,T,1
         temperatures = torch.nan_to_num(temperatures, nan=1.0)
 
         calibrated_logits = logits*temperatures # B,T,num_classes * B,T,1
         
-        B,T,num_classes = calibrated_logits.shape
-        # loss = F.cross_entropy(calibrated_logits.view(B*T, num_classes), labels.view(B*T))        
-        
-        # print(calibrated_logits.shape, logits.shape, labels.shape, temperatures.shape)
-        # exit()
         probs, preds = F.softmax(logits, dim=-1).max(dim=-1)
         calibrated_probs, calibrated_preds = F.softmax(calibrated_logits, dim=-1).max(dim=-1)
-
-        mean_valid = lambda x: np.ma.masked_invalid(x.cpu()).mean()
+        
+        # print(temperatures[:, -1, :].mean().item(), temperatures[:, -1, :].min().item(), temperatures[:, -1, :].max().item())
+        # print(calibrated_pred_probs[:, -1, :].mean().item(), calibrated_pred_probs[:, -1, :].min().item(), calibrated_pred_probs[:, -1, :].max().item(), calibrated_pred_probs[:, -1, :].std().item())
+        
+        # print(calibrated_probs[:, -1].mean().item(), calibrated_probs[:, -1].min().item(), calibrated_probs[:, -1].max().item(), calibrated_probs[:, -1].std().item())
         
         print(f"|------Dataset: {dataset}------|")
         for shot in range(shots_start, T):
-            eval_metrics = Metrics(logits[:, [shot], :], calibrated_logits[:, [shot], :], labels[:, [shot]], 
-                                   shots_start=0, prepare_rel_diag=True)
-     
+            calibrator_metrics[shot] = CalibrationMetrics(logits[:, [shot], :], calibrated_logits[:, [shot], :], labels[:, [shot]], 
+                                   shots_start=0, prepare_rel_diag=plot_results, plot_confidence_band=plot_confidence_band)
+            # print(calibrator_metrics[shot].calibrated_ece); exit()
             temps = temperatures[:, shot, :].flatten().cpu().numpy()
             accuracy = (labels == preds).cpu()[:, shot].sum() / len(preds)
             conf_original = mean_valid(probs[:, shot])
             conf_calibrated = mean_valid(calibrated_probs[:, shot])
 
-            # static temp scaling
-            static_temp_calibrated_logits = logits[:, [shot], :] * shotwise_static_temps[shot]
-            static_temp_calibrated_probs, static_temp_calibrated_preds = F.softmax(static_temp_calibrated_logits, dim=-1).max(dim=-1)
+            dynamic_temp_metrics[shot], dynamic_temp_conf_calibrated = get_calibrated_metrics_and_conf(logits[:, [shot], :], labels[:, [shot]], shotwise_dynamic_temps[shot].view(B, 1, 1))
 
-            # print(static_temp_calibrated_logits[:, [shot], :].shape, labels[:, [shot]].shape, shot); exit()
-            static_temp_eval_metrics = Metrics(logits[:, [shot], :], static_temp_calibrated_logits[:, : , :], labels[:, [shot]], 
-                                   shots_start=0, prepare_rel_diag=False)
-     
-            static_temp_conf_calibrated = mean_valid(static_temp_calibrated_probs[:, :])
+            static_temp_metrics[shot], static_temp_conf_calibrated = get_calibrated_metrics_and_conf(logits[:, [shot], :], labels[:, [shot]], shotwise_static_temps[shot])
             
-            calibration_data.add_shot_metrics(
-                shot, eval_metrics, static_temp_eval_metrics, 
-                temps, shotwise_static_temps[shot], 
-                accuracy, conf_original, 
-                conf_calibrated, static_temp_conf_calibrated
-            )
+            if plot_gt_calibration:
+                global_temp_metrics[shot], global_temp_conf_calibrated = get_calibrated_metrics_and_conf(logits[:, [shot], :], labels[:, [shot]], shotwise_global_temps[shot])
             
-            print(f"{shot} shot accuracy {calibration_data.accuracies[shot-shots_start]:.4f}, \
-            mean prob {calibration_data.conf_shots_map['original'][shot]:.4f}   \
-            mean calibrated prob {calibration_data.conf_shots_map['calibrated'][shot]:.4f} \
-            mean static temp calibrated prob {calibration_data.conf_shots_map['static_temp_calibrated'][shot]:.4f}")
-        # exit()
-        # print(torch.isnan(temperatures).any()) ;exit()
-        # print(ece_loss(calibrated_logits, labels)); exit()
+                calibration_data.add_shot_metrics(shot, 
+                    calibrator_metrics[shot], dynamic_temp_metrics[shot], static_temp_metrics[shot], global_temp_metrics[shot],
+                    temps, mean_valid(shotwise_dynamic_temps[shot]), shotwise_static_temps[shot], shotwise_global_temps[shot],
+                    accuracy, 
+                    conf_original, conf_calibrated, dynamic_temp_conf_calibrated, static_temp_conf_calibrated, global_temp_conf_calibrated
+                )
+            else:
+                calibration_data.add_shot_metrics(shot, 
+                    calibrator_metrics[shot], dynamic_temp_metrics[shot], static_temp_metrics[shot], None,
+                    temps, mean_valid(shotwise_dynamic_temps[shot]), shotwise_static_temps[shot], None,
+                    accuracy, 
+                    conf_original, conf_calibrated, dynamic_temp_conf_calibrated, static_temp_conf_calibrated, None
+                )
+            
+            shot_summary = f"{shot} shot accuracy {calibration_data.accuracies[shot-shots_start]:.4f}, \
+    mean prob {calibration_data.conf_shots_map['original'][shot]:.4f}   \
+    mean TF calibrated prob {calibration_data.conf_shots_map['calibrated'][shot]:.4f} \
+    mean DT calibrated prob {calibration_data.conf_shots_map['dynamic_temp_calibrated'][shot]:.4f}\
+    mean ST calibrated prob {calibration_data.conf_shots_map['static_temp_calibrated'][shot]:.4f}"
+    
+            if plot_gt_calibration:
+                shot_summary += f"\
+    mean GT calibrated prob {calibration_data.conf_shots_map['global_temp_calibrated'][shot]:.4f}"
         
-        overall_metrics = Metrics(logits, calibrated_logits, labels, shots_start=shots_start, prepare_rel_diag=True)
-        calibration_data.overall_reldiag = {"original":overall_metrics.rel_diag, "calibrated":overall_metrics.calibrated_rel_diag}
+            print(shot_summary)
+        
+        num_shots = T - shots_start
+        
+        overall_calibrator_metrics = sum(calibrator_metrics.values(), start=CalibrationMetrics.zeros()) / num_shots
+        overall_dynamic_temp_metrics = sum(dynamic_temp_metrics.values(), start=CalibrationMetrics.zeros()) / num_shots
+        overall_static_temp_metrics = sum(static_temp_metrics.values(), start=CalibrationMetrics.zeros()) / num_shots
+        
+        if plot_gt_calibration:
+            overall_global_temp_metrics = sum(global_temp_metrics.values(), start=CalibrationMetrics()) / num_shots
+            calibration_data.add_overall_metrics(overall_calibrator_metrics, overall_dynamic_temp_metrics, 
+                                                overall_static_temp_metrics, overall_global_temp_metrics)
+        else:
+            calibration_data.add_overall_metrics(overall_calibrator_metrics, overall_dynamic_temp_metrics, 
+                                                overall_static_temp_metrics)
         
         return calibration_data
-  
-def get_shotwise_static_temperatures(split_data, shots_start):  
-    inputs, logits, labels = get_batch(split_data, batch_size=None) # len(eval),T,C | len(eval),T,num_classes | len(eval),T
-    
-    B,T,num_classes = logits.shape
-    tuned_temps = {}
-    
-    for shot in range(shots_start, T):
-        shot_logits, shot_labels = logits[:, shot, :], labels[:, shot]
-        tuned_temps[shot] = tune_temp(shot_logits, shot_labels)
-        
-    return tuned_temps
 
-def tune_temp(logits, labels, lower=0.01, upper=5.0, eps=0.00001):
+def get_calibrated_metrics_and_conf(logits, labels, temps):
+    temp_calibrated_logits = logits * temps
+    temp_calibrated_probs, temp_calibrated_preds = F.softmax(temp_calibrated_logits, dim=-1).max(dim=-1)
 
-    logits = logits.detach().cpu()
-    labels = labels.detach().cpu()
+    temp_eval_metrics = CalibrationMetrics(logits, temp_calibrated_logits, labels, 
+                                    shots_start=0, prepare_rel_diag=False)
 
-    while upper - lower > eps:
-        t_guess = torch.tensor([0.5 * (lower + upper)], requires_grad=True)
-        loss = F.cross_entropy(logits * t_guess, labels)
-        grad = torch.autograd.grad(loss, t_guess)[0]
-        
-        if  grad> 0:
-            upper = 0.5 * (lower + upper)
-        else:
-            lower = 0.5 * (lower + upper)
-        
-    t = min([lower, 0.5 * (lower + upper), upper], key=lambda x: float(F.cross_entropy(logits * x, labels)))
-    return t
+    temp_conf_calibrated = mean_valid(temp_calibrated_probs)
+    
+    return temp_eval_metrics, temp_conf_calibrated 
 
-# def get_equivalent_temp(logits: torch.tensor, calibrated_prob: float, eps=1e-5):
-#     lower, upper = 0.01, 5
+def mean_valid(x):
+    return np.ma.masked_invalid(x.cpu()).mean()
+
+def get_stats_summary(message, metrics):
+    summary = []
+    summary.append(f"\n{message}:")
+    summary.append(f"  Mean  : {np.mean(metrics):.4f}")
+    summary.append(f"  Std   : {np.std(metrics):.4f}")
+    summary.append(f"  Min   : {np.min(metrics):.4f}")
+    summary.append(f"  Max   : {np.max(metrics):.4f}")
+    summary.append(f"  Median: {np.median(metrics):.4f}")
     
-#     get_prob_gap = lambda args : abs(F.softmax(args[0], dim=-1).max() - args[1])
-#     while get_prob_gap > eps:
-#         mid = (lower+upper)/2
-        
-def get_equivalent_temp(logits, calibrated_pred_probs, num_iters=20):
-    """Binary search for T such that softmax(logits/T).max() = target_max_prob"""
-    B, T_seq, C = logits.shape
-    target_log_prob = torch.log(calibrated_pred_probs)  # B, T_seq, 1
+    summary = "\n".join(summary)
     
-    T_low = torch.ones(B, T_seq, 1, device=logits.device) * 0.01
-    T_high = torch.ones(B, T_seq, 1, device=logits.device) * 100.0
-    
-    for _ in range(num_iters):
-        T_mid = (T_low + T_high) / 2
-        scaled_logits = logits * T_mid
-        log_probs = scaled_logits - scaled_logits.logsumexp(dim=-1, keepdim=True)
-        current_max_log_prob = log_probs.max(dim=-1, keepdim=True).values
-        
-        # If current max prob is too high, T is too low (need to flatten more)
-        T_high = torch.where(current_max_log_prob > target_log_prob, T_mid, T_high)
-        T_low = torch.where(current_max_log_prob <= target_log_prob, T_mid, T_low)
-    
-    return (T_low + T_high) / 2
-        
+    return summary
+
+def args_check(args):
+    if args['plot_confidence_band'] is True:
+        assert args['plot_results'] is True, "Turn on plotting of results, you have plot_confidence_band as True"
 
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--models', dest='models', action='store', required=True, help='name of models to eval the calibrator on')
+    parser.add_argument('--llms', dest='llms', action='store', required=True, help='name of llms to evaluate the calibrator on')
     parser.add_argument('--datasets', dest='datasets', action='store', required=True, help='name of datasets to eval the calibrator on')    
-    parser.add_argument('--feature_type', dest='feature_type', action='store', required=False, default="class_agnostic", help='the type of input features that make up the dataset')
-    parser.add_argument('--shots_start', dest='shots_start', action='store', required=False, type=int, default=2, help='which shot # onwards we will do calibration for training and eval')
+    parser.add_argument('--feature_type', dest='feature_type', action='store', required=False, default="", help='the type of input features that make up the dataset')
+    parser.add_argument('--shots_start', dest='shots_start', action='store', required=False, type=int, default=8, help='which shot # onwards we will do calibration eval')
+    parser.add_argument('--shots_end', dest='shots_end', action='store', required=False, type=int, default=20, help='Till which shot # we will do calibration eval')
     parser.add_argument('--sampling_strategy', dest='sampling_strategy', action='store', required=False, default=None, help='what sampling strategy data to select(entropy vs similarity) (default: None - means select all)')
     parser.add_argument('--gpu_id', dest='gpu_id', action='store', default=0, required=False, help='Which CUDA gpu to run model on', type=int)
+    
+    parser.add_argument('--model_name', dest='model_name', action='store', required=False, default="calibrator", help='custom name for the model(calibrator), used for saving the checkpoints')    
     parser.add_argument('--model_path', dest='model_path', action='store', default=None, required=False, help='Path of the model to be loaded ')
     parser.add_argument('--llm_agnostic', dest='llm_agnostic', action='store_const', const=True, default=False, help='whether to use the llm agnostic calibrator')
     parser.add_argument('--save_path', dest='save_path', action='store', default=None, required=False, help='What path to save the calibration plot to ')
+    
+    parser.add_argument('--plot_results', dest='plot_results', action='store_const', const=True, default=False, required=False, help='Whether to plot the results or just get eval metrics')
+    parser.add_argument('--plot_confidence_band', dest='plot_confidence_band', action='store_const', const=True, default=False, required=False, help='Whether to plot the confidence bands for the reliability plots')
+    parser.add_argument('--plot_gt_calibration', dest='plot_gt_calibration', action='store_const', const=True, default=False, required=False, help='Whether to plot the confidence bands for the reliability plots')
     
     args = parser.parse_args()
     args = vars(args)
 
     args['datasets'] = convert_to_list(args['datasets'])
-    args['models'] = convert_to_list(args['models'])
+    args['llms'] = convert_to_list(args['llms'])
     
     sampling_strategy = args.get('sampling_strategy')
     if sampling_strategy:
         args['sampling_strategy'] = sampling_strategy
         
+    args_check(args)
+    
     main(**args)

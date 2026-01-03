@@ -1,0 +1,265 @@
+import argparse
+import json
+import torch
+import torch.nn.functional as F
+
+from calibration.data_utils import get_batch, load_datasets
+
+def get_shotwise_static_temperatures(data, shots_start, batch_size=None):  
+    inputs, logits, labels = get_batch(data, batch_size=batch_size) # len(eval),T,C | len(eval),T,num_classes | len(eval),T
+    
+    B,T,num_classes = logits.shape
+    tuned_temps = {}
+    
+    for shot in range(shots_start, T):
+        shot_logits, shot_labels = logits[:, shot, :], labels[:, shot]
+        tuned_temps[shot] = tune_temp(shot_logits, shot_labels)
+        
+    return tuned_temps
+
+def tune_temp(logits, labels, lower=0.01, upper=5.0, eps=0.00001):
+    # if logits.device!='cpu':
+    #     logits = logits.detach().cpu()
+    #     labels = labels.detach().cpu()
+
+    while upper - lower > eps:
+        t_guess = torch.tensor([0.5 * (lower + upper)], device=logits.device, requires_grad=True)
+        loss = F.cross_entropy(logits * t_guess, labels)
+        grad = torch.autograd.grad(loss, t_guess)[0]
+        
+        if  grad> 0:
+            upper = 0.5 * (lower + upper)
+        else:
+            lower = 0.5 * (lower + upper)
+        
+    t = min([lower, 0.5 * (lower + upper), upper], key=lambda x: float(F.cross_entropy(logits * x, labels)))
+    return t
+        
+def get_equivalent_temp(logits, calibrated_pred_probs, num_iters=200):
+    """Binary search for T such that the temperature scaled prediction prob is the same as the calibrated prob given by calibrator"""
+    B, T_seq, C = logits.shape
+    target_log_prob = torch.log(calibrated_pred_probs)  # B, T_seq, 1
+    
+    T_low = torch.ones(B, T_seq, 1, device=logits.device) * 0.01
+    T_high = torch.ones(B, T_seq, 1, device=logits.device) * 100.0
+    
+    for _ in range(num_iters):
+        T_mid = (T_low + T_high) / 2
+        scaled_logits = logits * T_mid
+        log_probs = scaled_logits - scaled_logits.logsumexp(dim=-1, keepdim=True)
+        current_max_log_prob = log_probs.max(dim=-1, keepdim=True).values
+        
+        # If current max prob is too high, T is not low enough (need to flatten more)
+        T_high = torch.where(current_max_log_prob > target_log_prob, T_mid, T_high)
+        T_low = torch.where(current_max_log_prob <= target_log_prob, T_mid, T_low)
+    
+    return (T_low + T_high) / 2
+ 
+def get_equivalent_temp_gd(logits, calibrated_pred_probs, num_iters=500, lr=0.1):
+    """Gradient descent to find T such that temperature scaled prediction prob matches calibrated prob"""
+    B, T_seq, C = logits.shape
+    target_log_prob = torch.log(calibrated_pred_probs)  # B, T_seq, 1
+    
+    # Initialize T (require gradients)
+    T = torch.ones(B, T_seq, 1, device=logits.device, requires_grad=True)
+    
+    # Use an optimizer
+    optimizer = torch.optim.AdamW([T], lr=lr)
+    
+    for _ in range(num_iters):
+        optimizer.zero_grad()
+        
+        # Apply temperature scaling (your convention: multiply)
+        scaled_logits = logits * T
+        log_probs = scaled_logits - scaled_logits.logsumexp(dim=-1, keepdim=True)
+        current_max_log_prob = log_probs.max(dim=-1, keepdim=True).values
+        
+        # Loss: MSE between current and target log probs
+        loss = ((current_max_log_prob - target_log_prob) ** 2).mean()
+        
+        loss.backward()
+        optimizer.step()
+        
+        # Clamp T to reasonable range
+        with torch.no_grad():
+            T.clamp_(0.01, 100.0)
+    
+    return T.detach()
+ 
+def tune_temp_combined(logits_list, labels_list, lower=0.01, upper=5.0, eps=0.01):
+    """
+    Tune a single temperature across multiple datasets with different num_classes.
+    
+    Args:
+        logits_list: List of tensors, each of shape (B_i, num_classes_i)
+        labels_list: List of tensors, each of shape (B_i,)
+    """
+    # Move to CPU if needed
+    # logits_list = [logits.detach().cpu() if logits.device != 'cpu' else logits for logits in logits_list]
+    # labels_list = [labels.detach().cpu() if labels.device != 'cpu' else labels for labels in labels_list]
+
+    while upper - lower > eps:
+        t_guess = torch.tensor([0.5 * (lower + upper)], device=logits_list[0].device, requires_grad=True)
+        
+        # Compute combined loss across all datasets
+        total_loss = 0
+        for logits, labels in zip(logits_list, labels_list):
+            total_loss += F.cross_entropy(logits * t_guess, labels)
+        
+        grad = torch.autograd.grad(total_loss, t_guess)[0]
+        
+        if grad > 0:
+            upper = 0.5 * (lower + upper)
+        else:
+            lower = 0.5 * (lower + upper)
+    
+    # Final selection: evaluate all three candidates
+    def eval_loss(t):
+        total = 0
+        for logits, labels in zip(logits_list, labels_list):
+            total += float(F.cross_entropy(logits * t, labels))
+        return total
+    
+    t = min([lower, 0.5 * (lower + upper), upper], key=eval_loss)
+    return t
+
+
+def get_combined_shotwise_static_temperatures(data, shots_start):  
+    """
+    Learn a common temperature across all datasets for each shot position.
+    
+    Args:
+        data: Dict mapping dataset_key -> {'inputs': ..., 'logits': ..., 'labels': ...}
+        shots_start: First shot position to start calibration from
+    """
+    # First, collect all data organized by shot position
+    shot_data = {}  # shot -> {'logits_list': [...], 'labels_list': [...]}
+    
+    for dataset_key in data.keys():
+        inputs, logits, labels = get_batch(data[dataset_key], batch_size=None)
+        B, T, num_classes = logits.shape
+        
+        for shot in range(shots_start, T):
+            if shot not in shot_data:
+                shot_data[shot] = {'logits_list': [], 'labels_list': []}
+            
+            shot_logits = logits[:, shot, :]  # (B, num_classes)
+            shot_labels = labels[:, shot]      # (B,)
+            
+            shot_data[shot]['logits_list'].append(shot_logits)
+            shot_data[shot]['labels_list'].append(shot_labels)
+    
+    # Now tune temperature for each shot using combined loss
+    tuned_temps = {}
+    for shot, data_dict in shot_data.items():
+        tuned_temps[shot] = tune_temp_combined(
+            data_dict['logits_list'], 
+            data_dict['labels_list']
+        )
+    
+    return tuned_temps
+
+def tune_temp_for_sequence(logits_seq: torch.TensorType, labels_seq: torch.TensorType, 
+                           temp_init: torch.TensorType = None, iterations: int = 500, lr: float = 0.01):
+    """Train a temp for each sequence of predictions for each sequence in batch
+
+    Args:
+        logits_seq (torch.TensorType): (B, k-shots, num_classes) 
+        labels_seq (torch.TensorType): (B, k-shots)
+    
+    Returns:
+        temperatures (torch.TensorType): (B,) optimized temperatures
+    """    
+    B, K, num_classes = logits_seq.shape
+    if temp_init is None:
+        temperatures = torch.ones(B, device=logits_seq.device, requires_grad=True)
+    else:
+        temperatures = temp_init.clone().detach().requires_grad_(True)
+            
+    optimizer = torch.optim.AdamW([temperatures], lr=lr) 
+    
+    for _ in range(iterations):
+        optimizer.zero_grad()
+        
+        calibrated_logits = logits_seq * temperatures.view(B, 1, 1)  # (B, K, C)
+        
+        loss = F.cross_entropy(
+            calibrated_logits.reshape(B*K, num_classes), 
+            labels_seq.reshape(B*K),
+        )
+        
+        loss.backward()
+        optimizer.step()
+        
+        if temperatures.grad is not None and torch.norm(temperatures.grad) < 0.001:
+            break
+    
+    return temperatures.detach()        
+    
+def get_shotwise_dynamic_temperatures(data, shots_start):
+    logits, labels = data['logits'], data['labels'] # len(eval),T,num_classes | len(eval),T
+    
+    B,T,num_classes = logits.shape
+    tuned_temps = {}
+    temp_init = None
+    
+    for shot in range(shots_start, T):
+        logits_seq, labels_seq = logits[:, :shot, :], labels[:, :shot]
+        tuned_temps[shot] = tune_temp_for_sequence(logits_seq, labels_seq, temp_init)
+        
+        temp_init = tuned_temps[shot]
+        
+    return tuned_temps
+
+def main(llms, 
+         datasets,
+         feature_type,
+         shots_start,
+         sampling_strategy = None,
+         gpu_id=0):
+    
+    device = f'cuda:{gpu_id}'
+    
+    data = load_datasets(llms, datasets, device, feature_type, splits=('train',), 
+                        sampling_strategy=sampling_strategy, temp_augment=False, label_augment=False)
+    print("Loaded the datasets")
+
+    # Restructure data to be flat dict of all llm-dataset combinations
+    combined_data = {}
+    for llm in llms:
+        for dataset in datasets:
+            key = f"{llm}_{dataset}"
+            combined_data[key] = data[llm][dataset]['train']
+        
+    shotwise_static_temps = get_combined_shotwise_static_temperatures(combined_data, shots_start)
+    
+    shotwise_static_temps = {k: float(v) for k, v in shotwise_static_temps.items()}
+    
+    with open("calibration/trained_temperature.json", "w") as file:
+        json.dump(shotwise_static_temps, file)
+    
+    print(f"Saved temperatures for shots {shots_start} onwards to calibration/trained_temperature.json")
+    
+if __name__ == '__main__':
+    from utils import convert_to_list
+    
+    parser = argparse.ArgumentParser()
+
+    parser.add_argument('--llms', dest='llms', action='store', required=True, help='name of llms to evaluate the calibrator on')
+    parser.add_argument('--datasets', dest='datasets', action='store', required=True, help='name of datasets to eval the calibrator on')    
+    parser.add_argument('--feature_type', dest='feature_type', action='store', required=False, default="", help='the type of input features that make up the dataset')
+    parser.add_argument('--shots_start', dest='shots_start', action='store', required=False, type=int, default=10, help='which shot # onwards we will do calibration for training and eval')
+    parser.add_argument('--sampling_strategy', dest='sampling_strategy', action='store', required=False, default=None, help='what sampling strategy data to select(entropy vs similarity) (default: None - means select all)')
+    parser.add_argument('--gpu_id', dest='gpu_id', action='store', default=0, required=False, help='Which CUDA gpu to run model on', type=int)
+
+    args = parser.parse_args()
+    args = vars(args)
+
+    args['datasets'] = convert_to_list(args['datasets'])
+    args['llms'] = convert_to_list(args['llms'])
+    
+    sampling_strategy = args.get('sampling_strategy')
+    if sampling_strategy:
+        args['sampling_strategy'] = sampling_strategy
+    
+    main(**args)

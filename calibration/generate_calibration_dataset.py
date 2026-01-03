@@ -12,22 +12,25 @@ from time import time
 import logging
 import multiprocessing as mp
 
-logFormatter = logging.Formatter(
-    "{asctime} - {levelname} - {message}", 
-    style="{",
-    datefmt="%Y-%m-%d %H:%M"
-)
-logger = logging.getLogger()
+def setup_logger():
+    logFormatter = logging.Formatter(
+        "{asctime} - {levelname} - {message}", 
+        style="{",
+        datefmt="%Y-%m-%d %H:%M"
+    )
+    logger = logging.getLogger(__name__)
 
-fileHandler = logging.FileHandler("./cal_data_gen.log")
-fileHandler.setFormatter(logFormatter)
-logger.addHandler(fileHandler)
+    fileHandler = logging.FileHandler("./cal_data_gen.log")
+    fileHandler.setFormatter(logFormatter)
+    logger.addHandler(fileHandler)
 
-consoleHandler = logging.StreamHandler()
-consoleHandler.setFormatter(logFormatter)
-logger.addHandler(consoleHandler)
+    consoleHandler = logging.StreamHandler()
+    consoleHandler.setFormatter(logFormatter)
+    logger.addHandler(consoleHandler)
 
-logger.setLevel(logging.INFO)
+    logger.setLevel(logging.INFO)
+
+    return logger
 
 SAVE_DIR = 'calibration/datasets'
 os.makedirs(SAVE_DIR, exist_ok=True)
@@ -53,7 +56,7 @@ def save_dataset(params, generated_dataset):
                 data = prev_data + data                           
         
         with open(file_name, 'w') as file:  
-            json.dump(data, file, indent=2)
+            json.dump(data, file)
 
         logger.info(f"Saved to {file_name}")
         
@@ -146,11 +149,11 @@ def generate_calibration_datasets(params_list: List[Dict], datasets: Dict, calib
                     k=1
                     )[0]
                 if sampling_strategy==SamplingStrategy.ENTROPY:        
-                    selected_sentences, selected_labels, selected_idxs = random_sampling(all_sentences, all_labels, num_shots+1, "rand") 
+                    selected_sentences, selected_labels, selected_idxs = random_sampling(all_sentences, all_labels, num_shots+1, EntropyLevels.RANDOM) 
                     selected_embeddings = np.array([all_embeddings[idx] for idx in selected_idxs])
                     data = data_generation_fn(params, selected_sentences, selected_embeddings, selected_labels)
                 elif sampling_strategy==SamplingStrategy.SIMILARITY:
-                    selected_sentences, selected_labels, selected_idxs = random_sampling(all_sentences, all_labels, 1, "rand") 
+                    selected_sentences, selected_labels, selected_idxs = random_sampling(all_sentences, all_labels, 1, EntropyLevels.RANDOM) 
                     selected_embeddings = np.array([all_embeddings[idx] for idx in selected_idxs]) # only 1 idx here
                     sampled_data = similarity_sampling(all_sentences, all_embeddings, all_labels, 
                                                        test_embeddings=selected_embeddings, num_shots=num_shots+1, shuffle=True, return_embeddings=True)
@@ -169,10 +172,11 @@ def args_check(args: Dict):
     pass
 
 if __name__ == '__main__':
+    logger = setup_logger()
+
     parser = argparse.ArgumentParser()
-    os.environ['CUDA_DEVICE_ORDER'] = 'PCI_BUS_ID'
-    # mp.set_start_method('spawn', force=True)
-    # setup_single_threading()
+    # mp.set_start_method('fork', force=True)
+    setup_single_threading()
     setup_vllm_env_settings()
 
     parser.add_argument('--model', dest='models', action='store', required=True, help='name of model(s), e.g., GPT2-XL')
@@ -184,11 +188,12 @@ if __name__ == '__main__':
                             default=2000, help='how big of a test dataset you want to generate')
     parser.add_argument('--append_data', dest='append_data', action='store_const', required=False, const=True, default=False,
                             help='append to existing dataset if True, overwrite otherwise')
+    
     parser.add_argument('--embedding_model', dest='embedding_model', action='store', required=False, default='google/embeddinggemma-300m',
                             help='append to existing dataset if True, overwrite otherwise')
     parser.add_argument('--embedding_dim', dest='embedding_dim', action='store', required=False, default=128, help='embedding dim if using Matryoshka trained model', type=int)
     
-    parser.add_argument('--api_num_log_prob', dest='api_num_log_prob', action='store', required=False, type=int,
+    parser.add_argument('--api_num_logprob', dest='api_num_log_prob', action='store', required=False, type=int,
                         default=100, help='number of top tokens to ask for when querying the model. Capped at 100 for OpenAI GPT-3 API')
     parser.add_argument('--bs', dest='bs', action='store', required=False, type=int, default=None,
                         help='batch size for model queries. For OpenAI API, capped at 20. For local running, set this to max out your GPU memory.')

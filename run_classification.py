@@ -1,25 +1,30 @@
 import argparse
 import os
 import shutil
-from data_utils import load_dataset_with_embeddings, set_prompt_params, IclDataset, IclDatasetSplit
-from utils import *
-from losses import ECELoss
-from calibrate.tempture import *
 from tqdm import tqdm 
 import numpy as np
 from time import time
-from sampling_strategies import SamplingStrategy
-import logging
 import multiprocessing as mp
+
+from data_utils import load_dataset_with_embeddings, set_prompt_params, IclDataset, IclDatasetSplit
+from utils import *
+from metrics import ClassificationMetrics
+from losses import smooth_ece
+
+from calibration_methods import CalibrationMethods
+from sampling_strategies import SamplingStrategy
+from calibration.generate_calibration_dataset import get_autoregressive_results, get_shifted_features, generate_data_class_agnostic_with_embeddings
+
+import logging
 
 logFormatter = logging.Formatter(
     "{asctime} - {levelname} - {message}", 
     style="{",
     datefmt="%Y-%m-%d %H:%M"
 )
-logger = logging.getLogger()
+logger = logging.getLogger(__name__)
 
-fileHandler = logging.FileHandler("./calibration.log")
+fileHandler = logging.FileHandler(ROOT_DIR/"calibration.log")
 fileHandler.setFormatter(logFormatter)
 logger.addHandler(fileHandler)
 
@@ -29,12 +34,12 @@ logger.addHandler(consoleHandler)
 
 logger.setLevel(logging.INFO)
 
-SAVE_DIR_TMP = './raw_logits_high_bs'
+SAVE_DIR_TMP = ROOT_DIR/"saved_results"
 os.makedirs(SAVE_DIR_TMP, exist_ok=True)
 
 def save_pickle_tmp(params, data):
     # save results from model
-    sampling = params['entropy_level'] if params['sampling_strategy']==SamplingStrategy.ENTROPY else 'similarity'
+    sampling = params['entropy_level'].name if params['sampling_strategy']==SamplingStrategy.ENTROPY else 'similarity'
     file_name = (f"{SAVE_DIR_TMP}/{params['model'].replace('/','_')}/{params['dataset']}/" # In case it's an HF model
                  f"{sampling}/{params['num_shots']}_shot/{params['seed']}_seed.pkl") 
     
@@ -67,7 +72,7 @@ def main(models, datasets, all_shots, num_seeds, subsample_test_set, api_num_log
             if sampling_strategy==SamplingStrategy.ENTROPY:
                 for entropy_level in entropy_levels:
                     for num_shots in all_shots:
-                        if entropy_level not in ("rand", "randshared") and num_shots==0:
+                        if entropy_level!=EntropyLevels.RANDOM and num_shots==0:
                             continue
                         for seed in range(num_seeds):
                             p = deepcopy(default_params)
@@ -122,9 +127,8 @@ def run_and_save_results(params_list: List[Dict], datasets: Dict):#, min_confide
     Run the model and save its responses and the rest of configs into a pickle file
     """
     result_tree = dict()
-    ece_loss = ECELoss(n_bins=30)
 
-    for param_index, params in tqdm(enumerate(params_list), total=len(params_list), desc="Processing experiments"):
+    for _, params in tqdm(enumerate(params_list), total=len(params_list), desc="Processing experiments"):
         file_name = os.path.join(SAVE_DIR_TMP, f"{params['expr_name'].replace('/','_')}.pkl")
         # if os.path.isfile(file_name):
         #     logging.info("Skipping experiment, already done before.")
@@ -137,57 +141,49 @@ def run_and_save_results(params_list: List[Dict], datasets: Dict):#, min_confide
         dataset: IclDataset = datasets[params['dataset']]
         all_train_sentences, all_train_labels, all_train_embeddings = dataset.train.sentences, dataset.train.labels, dataset.train.embeddings 
         all_test_sentences, all_test_labels, all_test_embeddings = dataset.test.sentences, dataset.test.labels, dataset.test.embeddings
+        # all_sentences, all_labels, all_embeddings = dataset.train.sentences, dataset.train.labels, dataset.train.embeddings 
+        # split_size = int(0.8*len(all_sentences))
+        # all_train_sentences, all_train_labels, all_train_embeddings = all_sentences[:split_size], all_labels[:split_size], all_embeddings[:split_size]
+        # all_test_sentences, all_test_labels, all_test_embeddings = all_sentences[split_size:], all_labels[split_size:], all_embeddings[split_size:]
         
         logger.info("Train sizes: %d sentences, %d labels, %d embeddings | Test sizes: %d sentences, %d labels, %d embeddings",
                 len(all_train_sentences), len(all_train_labels), len(all_train_embeddings),
                 len(all_test_sentences), len(all_test_labels), len(all_test_embeddings)
         )
-        # params_check(params)
 
         ### sample few-shot training examples
-        # np.random.seed(params['seed'])
         num_shots = params['num_shots'] 
-        calibration_method = params.get('calibration')
+        calibration_methods = params.get('calibration')
+        has_calibration_set = set(calibration_methods).intersection({CalibrationMethods.GC, CalibrationMethods.BC})             
 
+        train_sentences, train_labels, train_embeddings = [], [], [] 
+            
         if params['sampling_strategy']==SamplingStrategy.ENTROPY:
-            # np.random.seed(0)
             test_sentences, test_labels, test_embeddings = get_test_data(all_test_sentences, all_test_labels, all_test_embeddings, params['subsample_test_set'])
-            # np.random.seed(params['seed'])
-            train_sentences, train_labels = [], []
-            train_embeddings = [] # used in transformer calibration 
+
             
             for i in range(len(test_sentences)):
-                test_label = test_labels[i] if params['entropy_level'] in ('labelspike', 'labelsuppress') else None
                 selected_sentences, selected_labels, selected_idxs = random_sampling(all_train_sentences, all_train_labels,
-                                                                      num_shots, params['entropy_level'], test_label) 
-                if calibration_method in ('GC', 'GC_unif', 'BC'):
-                    calibration_test_sentences, calibration_test_labels = [], [] 
+                                                                      num_shots, params['entropy_level'], test_labels[i]) 
+                                   
+                if has_calibration_set:
+                    calib_set_sentences, calib_set_labels = [], [] 
 
                     remaining_sentences = [sentence for i, sentence in enumerate(all_train_sentences) if i not in set(selected_idxs)]
-                    remaining_labels = [label for i, label in enumerate(all_train_labels) if i not in set(selected_idxs)]
+                    remaining_labels    = [label    for i, label    in enumerate(all_train_labels)    if i not in set(selected_idxs)]
                    
-                    if calibration_method in ('GC', 'BC'):
-                        calib_set_entropy = 'rand'
-                    elif calibration_method == 'GC_unif':
-                        calib_set_entropy = 'max' # balanced/uniform distribution for labels to not get class imbalance bias 
-                    
-                    calibration_test_sentences, calibration_test_labels, _ = random_sampling(remaining_sentences, remaining_labels,
-                                                                                              params['calibration_set_size'], calib_set_entropy)
-                    # sharing the k-shot examples is expected for GC, BC
-                    train_sentences = [selected_sentences]*len(test_sentences)
-                    train_labels = [selected_labels]*len(test_sentences)
-                    break
-                elif calibration_method=='TC':
+                    calib_set_sentences, calib_set_labels, _ = random_sampling(remaining_sentences, remaining_labels,
+                                                                                              params['calibration_set_size'], EntropyLevels.RANDOM)
+                
+                if CalibrationMethods.TF in calibration_methods:
                     train_embeddings.append([all_train_embeddings[idx] for idx in selected_idxs])
-                    # print(train_embeddings, selected_idxs); exit()
-                elif calibration_method is None:
-                    pass
-                else:
-                    raise NotImplementedError(f"{calibration_method} calibration method not defined")
-                                        
-                if params['entropy_level']=='randshared':
-                    train_sentences = [selected_sentences]*len(test_sentences)
-                    train_labels = [selected_labels]*len(test_sentences)
+                    # print(train_embeddings, selected_idxs); exit()            
+                
+                # sharing the training/in-context examples is expected for GC, BC which require separate calibration set
+                if params['prompt_shared'] or has_calibration_set:
+                    train_sentences = [selected_sentences for i in range(len(test_sentences))]
+                    train_embeddings = np.vstack([train_embeddings for i in range(len(test_sentences))])
+                    train_labels = [selected_labels for i in range(len(test_sentences))]
                     break
                 
                 train_sentences.append(selected_sentences)
@@ -196,11 +192,12 @@ def run_and_save_results(params_list: List[Dict], datasets: Dict):#, min_confide
         elif params['sampling_strategy']==SamplingStrategy.SIMILARITY:
             shuffle_examples = True
             if params['subsample_test_set']>=len(all_test_sentences) and not shuffle_examples and params['seed']>0:
-                logger.warning("Found less test inputs than requested, saving seed 0 results to avoid repeated experiments")
+                logger.warning("Found less test inputs in dataset than requested, saving seed 0 results to avoid repeated experiments")
                 model_name = params['expr_name'].replace('/','_') # In case it's an HF model
                 file_name = os.path.join(SAVE_DIR_TMP, f"{model_name}.pkl")
                 shutil.copy(file_name.replace(f"seed{params['seed']}", 'seed0'), file_name)
                 continue
+            
             test_sentences, test_labels, test_embeddings = get_test_data(all_test_sentences, all_test_labels, all_test_embeddings, params['subsample_test_set'])
 
             sampled_data = similarity_sampling(all_train_sentences, all_train_embeddings, all_train_labels, 
@@ -216,63 +213,68 @@ def run_and_save_results(params_list: List[Dict], datasets: Dict):#, min_confide
         ### Evaluate the performance and save all results
         logger.info(f"getting raw resp for {len(test_sentences)} test sentences with {num_shots} ICL examples.")
         
-        all_label_probs, all_label_raw_logits = get_results(params, train_sentences, train_labels, test_sentences)
+        probs, logits = get_results(params, train_sentences, train_labels, test_sentences)
         # print(all_label_probs[-1]); exit()
         # raw_resp_test2, all_label_probs2, all_label_raw_logits2 = get_results(params, train_sentences, train_labels, test_sentences)
 
         # print(all_label_probs[-1][0])
-        # # assert raw_resp_test==raw_resp_test2
         # assert np.array_equal(all_label_probs, all_label_probs2), f"{all_label_probs[-10:], all_label_probs2[-10:]}"
         # assert np.array_equal(all_label_raw_logits,all_label_raw_logits2) 
         # assert np.array_equal(np.argmax(all_label_probs, axis=-1), np.argmax(all_label_raw_logits, axis=-1)), f"Probs: {all_label_probs[-5:]}, Logits: {all_label_raw_logits[-5:]}"
-        # cur_rep = np.stack([resp['logprobs']['hidden_states'][-1].numpy() for resp in raw_resp_test])
-        # norm = np.linalg.norm(cur_rep, axis=1)  
-        # norm = [norm.mean()]
 
-        acc_original, conf_ori = eval_accuracy(all_label_probs, test_labels)
-        ece_original = ece_loss(all_label_raw_logits, test_labels)
+        acc_original, conf_ori = eval_accuracy(probs, test_labels)
+        ece_original = smooth_ece(logits, test_labels)
         accuracies = [acc_original]
         eces = [ece_original.item()]
         confs = [conf_ori]
 
-        if calibration_method is not None:
-            if 'TC' in calibration_method:
+        metrics = {}
+        if calibration_methods is not None:
+            if set(calibration_methods).intersection({CalibrationMethods.TF, CalibrationMethods.ICT}):
+                train_probs, train_logits = get_autoregregressive_train_results(params, train_sentences, train_labels)
+                combined_logits = np.concatenate([train_logits, np.expand_dims(logits, axis=1)], axis=1)
+                combined_labels = np.array([train_labels[i] + [test_labels[i]] for i in range(len(test_sentences))])
+            
+            if CalibrationMethods.TF in calibration_methods:
                 combined_sentences = [train_sentences[i] + [test_sentences[i]] for i in range(len(test_sentences))]
                 combined_embeddings = np.array([np.vstack((train_embeddings[i], [test_embeddings[i]])) for i in range(len(test_sentences))])
-                combined_labels = [train_labels[i] + [test_labels[i]] for i in range(len(test_sentences))]
                 
                 # print(all_train_embeddings.shape, train_embeddings.shape, combined_embeddings[0].shape); exit()
-                calibrated_label_probs = get_tc_probs(params, combined_sentences, combined_embeddings, combined_labels, all_label_raw_logits)
+                # transformer_calibrated_logits = get_tc_logits_tmp(params, combined_sentences, combined_embeddings, combined_labels)
+                transformer_calibrated_logits = get_tc_logits(params, train_sentences, train_embeddings, train_labels, train_logits, logits)
+                metrics[CalibrationMethods.TF] = ClassificationMetrics(logits, transformer_calibrated_logits, test_labels)
                 # assert np.array_equal(
-                #     np.argmax(all_label_raw_logits, axis=-1),
-                #     np.argmax(all_label_probs, axis=-1)
+                #     np.argmax(logits, axis=-1),
+                #     np.argmax(probs, axis=-1)
                 # )
                 # assert np.array_equal(
-                #     np.argmax(calibrated_label_probs, axis=-1),
-                #     np.argmax(all_label_probs, axis=-1)
+                #     np.argmax(calibrated_probs, axis=-1),
+                #     np.argmax(probs, axis=-1)
                 # )
-            else:
-                label_probs, label_raw_logits = get_results(params, train_sentences, train_labels, calibration_test_sentences)
+            if CalibrationMethods.ICT in calibration_methods:
+                ict_calibrated_logits = get_ict_logits(params, combined_logits, combined_labels)
+                metrics[CalibrationMethods.ICT] = ClassificationMetrics(logits, ict_calibrated_logits, test_labels)
+                
+            if CalibrationMethods.ICC in calibration_methods:
+                incontext_calibrated_logits = get_icc_logits(params, train_sentences, train_labels, probs)
+                metrics[CalibrationMethods.ICC] = ClassificationMetrics(logits, incontext_calibrated_logits, test_labels)
+            
+            if has_calibration_set:
+                calib_set_probs, calib_set_logits = get_results(params, train_sentences, train_labels, calib_set_sentences)
 
-                if 'GC' in calibration_method:
-                    calibrated_label_probs = get_gc_probs(params, all_label_probs, label_probs, calibration_test_labels)
-                elif 'BC' in calibration_method:
-                    calibrated_label_probs = get_bc_probs(all_label_raw_logits, label_raw_logits)
-            
-            acc_calibrated, conf_calibrated = eval_accuracy(calibrated_label_probs, test_labels)
-            ece_calibrated = ece_loss(calibrated_label_probs, test_labels, input_type='probs')
-            
-            # cur_rep = np.stack([resp['logprobs']['hidden_states'][-1].numpy() for resp in raw_resp_test])
-            # norm_calibrated = np.linalg.norm(cur_rep, axis=1)  
-            # norm_calibrated = norm_calibrated.mean()     
-            accuracies.append(acc_calibrated)
-            eces.append(ece_calibrated.item())
-            # norm.append(norm_calibrated)
-            confs.append(conf_calibrated)
+                if CalibrationMethods.GC in calibration_methods:
+                    generative_calibrated_logits = get_gc_logits(probs, calib_set_probs, calib_set_labels)
+                    metrics[CalibrationMethods.GC] = ClassificationMetrics(logits, generative_calibrated_logits, test_labels)
+                if CalibrationMethods.BC in calibration_methods:
+                    batch_calibrated_logits = get_bc_logits(logits, calib_set_logits)
+                    metrics[CalibrationMethods.BC] = ClassificationMetrics(logits, batch_calibrated_logits, test_labels)
+
+            accuracies.extend([metrics[method].calibrated_accuracy for method in calibration_methods])
+            eces.extend([metrics[method].calibration_metrics.calibrated_ece for method in calibration_methods])
+            confs.extend([metrics[method].mean_calibrated_conf for method in calibration_methods])
 
         print(f"Accuracies: {accuracies}")
         print(f"Ece      : {eces}")
-        # print(f"Norm      : {norm}")
         print(f"confidence      : {confs}")
         
         # add to result_tree
@@ -295,220 +297,204 @@ def run_and_save_results(params_list: List[Dict], datasets: Dict):#, min_confide
        
         if not f"{keys[3]}_ece" in entropy_node.keys():
             entropy_node[f"{keys[3]}_ece"] = dict()
-        if not f"{keys[3]}_diff" in entropy_node.keys():
-            entropy_node[f"{keys[3]}_diff"] = dict()
-        # if not f"{keys[3]}_norm" in entropy_node.keys():
-        #     entropy_node[f"{keys[3]}_norm"] = dict()
         if not f"{keys[3]}_conf" in entropy_node.keys():
             entropy_node[f"{keys[3]}_conf"] = dict()
+
         entropy_node[f"{keys[3]}_ece"][seed] = eces
         entropy_node[f"{keys[3]}_conf"][seed] = confs
-        # entropy_node[f"{keys[3]}_norm"][seed] = norm
 
         # save to file
         result_to_save = dict()
         params_to_save = deepcopy(params)
+        
         result_to_save['params'] = params_to_save
-        result_to_save['all_label_probs'] = all_label_probs
-        result_to_save['raw_logits'] = all_label_raw_logits
-        result_to_save['all_labels_prob_mass'] = np.sum(all_label_probs, axis=-1)
+        result_to_save['probs'] = probs
+        result_to_save['logits'] = logits
+        
         result_to_save['eces'] = eces
-        # result_to_save['norm'] = norm
         result_to_save['confs'] = confs
         result_to_save['accuracies'] = accuracies
-        if params.get('calibration'):
-            result_to_save['calibrated_label_probs'] = calibrated_label_probs
-            result_to_save['calibrated_eces'] = [ece_calibrated.item()]
-            result_to_save['calibrated_confs'] = [conf_calibrated]
-            result_to_save['calibrated_accuracies'] = [acc_calibrated]
-        if 'prompt_func' in result_to_save['params'].keys():
-            params_to_save['prompt_func'] = None
-        print_results(result_tree)
+        result_to_save['metrics'] = metrics
+            
+        print_results(result_tree, calibration_methods)
         save_pickle_tmp(params, result_to_save)
         # exit()
-    print_results(result_tree, log=logger.info)
-
-# outdated
-def calibrate_probs(params, all_label_probs, all_label_raw_logits, train_sentences, train_labels, test_sentences, test_labels):
-    label_probs, label_raw_logits = get_results(params, train_sentences, train_labels, test_sentences)
-
-    method = params['calibration']
-    if 'GC' in method:
-        return get_gc_probs(params, all_label_probs, label_probs, test_labels)
-    elif 'BC' in method:
-        return get_bc_probs(all_label_raw_logits, label_raw_logits)
-
+    print_results(result_tree, calibration_methods, log=logger.info)
     
-def get_gc_probs(params, all_label_probs, label_probs, test_labels):
-    all_label_probs = all_label_probs/np.sum(all_label_probs, axis=-1, keepdims=True) # normalize
-    label_probs = label_probs/np.sum(label_probs, axis=-1, keepdims=True) # normalize
-    label_marginal = np.mean(label_probs, axis=0) # marginalized probs 
-    if params['calibration'] == 'GC':
-        test_label_counter = Counter(test_labels)
-        label_prior = np.array(
-            [freq  for label, freq in sorted(list(test_label_counter.items()))]
-            )/len(test_labels)
-    elif params['calibration'] == 'GC_unif':
-        label_prior = np.full(len(params['label_dict']), 1/len(params['label_dict']))
+def get_autoregregressive_train_results(params, train_sentences, train_labels):
+    if params['prompt_shared']:
+        probs, logits = get_autoregressive_results(params, train_sentences[0], train_labels[0])    
+        train_probs = [probs.copy() for _ in range(len(train_sentences))]
+        train_logits = [logits.copy() for _ in range(len(train_sentences))] 
+    else:
+        train_probs, train_logits = [], []
+        
+        for i in range(len(train_sentences)):
+            probs, logits = get_autoregressive_results(params, train_sentences[i], train_labels[i])
+            train_probs.append(probs)
+            train_logits.append(logits)
+            
+    return train_probs, train_logits 
+        
+def get_ict_logits(params, combined_logits: np.ndarray, combined_labels: np.ndarray):
+    combined_logits = torch.from_numpy(combined_logits)
+    combined_labels = torch.from_numpy(combined_labels)
+    
+    data = {
+        "logits": combined_logits,
+        "labels": combined_labels
+    }
+    
+    num_shots = params['num_shots']
+    B, T, num_classes = combined_logits.shape
+    
+    temperatures = get_shotwise_dynamic_temperatures(data, shots_start=num_shots)
+    calibrated_logits = combined_logits[:, -1, :] * temperatures[num_shots].view(B, 1)
+    
+    return calibrated_logits.cpu().numpy()
 
-    all_label_logprobs = np.log(all_label_probs)
+def get_tc_logits_tmp(params: Dict, sentences: List[str], embeddings: np.ndarray, labels: List[int]):
+    from calibration.data_utils import recalculate_features
+    
+    inputs_batch = []
+    logits_batch = []
+    
+    for i in range(len(sentences)):
+        data = generate_data_class_agnostic_with_embeddings(params, sentences[i], embeddings[i], labels[i])
+        data = {
+            'inputs':torch.tensor(data['inputs']),
+            'logits':torch.tensor(data['logits'])
+        }
+        recalculate_features(data)
+        inputs_batch.append(data['inputs'])
+        logits_batch.append(data['logits'])
+        
+    inputs_batch = torch.stack(inputs_batch)
+    logits_batch = torch.stack(logits_batch)
+    
+    B, T, C = inputs_batch.shape
+    assert (B, T) == (len(sentences), len(sentences[-1])), f"{(B, T)} vs {(len(sentences), len(sentences[-1]))} mismatch"
+    
+    params['tc_input_dim'] = inputs_batch[0].shape[-1]
+    calibrated_logits = transformer_calibrate_tmp(params, inputs_batch, logits_batch)
+    
+    return calibrated_logits.cpu().numpy()
+
+def get_tc_logits(params: Dict, train_sentences: List[str], train_embeddings: np.ndarray, train_labels: List[int], train_logits: np.ndarray, logits: np.ndarray):
+    inputs_batch = []
+    for i in range(len(logits)):
+        inputs = generate_calibrator_inputs(params, train_sentences[i], train_embeddings[i], train_labels[i], train_logits[i].copy(), logits[i].copy())
+        inputs_batch.append(inputs)
+    
+    inputs_batch = torch.stack(inputs_batch)
+    logits = torch.tensor(logits)
+    
+    B, T, C = inputs_batch.shape
+    assert (B, T) == (len(train_sentences), len(train_sentences[-1])+1), f"{(B, T)} vs {(len(train_sentences), len(train_sentences[-1])+1)} mismatch"
+    
+    params['tc_input_dim'] = inputs_batch[0].shape[-1]
+    calibrated_logits = transformer_calibrate(params, inputs_batch, logits)
+    
+    return calibrated_logits.cpu().numpy()
+
+# Different feature set, made for causal temperature regression | class agnostic
+def generate_calibrator_inputs(params: Dict, train_sentences: List[str], train_embeddings: np.ndarray, train_labels: List[int], train_logits: np.ndarray, test_logits: np.ndarray):    
+    if train_logits is None:
+        train_probs, train_logits = get_autoregressive_results(params, train_sentences, train_labels)   
+    
+    logits = np.vstack([train_logits, test_logits])
+    
+    probs = torch.from_numpy(logits).softmax(dim=-1).numpy()
+    # print(probs.shape)
+        
+    preds = np.argmax(probs, axis=-1)
+    pred_probs = probs[np.arange(len(preds)), preds]
+    
+    # repeat last train label to get a dummy test label since the func expects same length list as the other probs and preds
+    shifted_features = get_shifted_features(probs, preds, train_labels+train_labels[-1:]) 
+
+    # input_similarity_vectors = np.tril(get_similarities(train_embeddings, train_embeddings)) # only lower triangular to make it causal
+    
+    # lower_dim_embeddings = get_embeddings(params, train_sentences)
+    
+    # T = len(train_sentences) # number of timesteps
+    # pred_similarity_vectors = np.zeros((T, T))
+    # for timestep in range(T):
+    #     for prev_timestep in range(timestep + 1):  # only compute for j <= i (causal)
+    #         js_div = js_divergence(probs[timestep], probs[prev_timestep])
+    #         pred_similarity_vectors[timestep, prev_timestep] = 1 - (js_div / np.log(2))  # Maps [0, log(2)] → [1, 0]
+
+    # Input to the calibration transformer is a concatenation of t<k shot probs, similarities and other features
+    inputs = [
+        np.concatenate((
+            [pred_probs[sent_idx]], 
+            [shifted_features.correctness[sent_idx]], 
+            [shifted_features.gt_probs[sent_idx]], 
+            # pred_similarity_vectors[sent_idx], 
+            # input_similarity_vectors[sent_idx],
+            # lower_dim_embeddings[sent_idx]
+        )).tolist()
+        for sent_idx in range(len(pred_probs))
+    ]
+
+    inputs = torch.tensor(inputs, dtype=torch.float32)
+
+    gt_prob_mses = torch.cat(
+        (
+            torch.tensor([[0.5]]), 
+            (1 - inputs[1:,[2]])**2
+        ), 
+        dim=0)
+    inputs = torch.cat((gt_prob_mses, inputs[:,:3]), dim=-1)
+    
+    # print(data['inputs']); exit()
+    return inputs
+
+def get_gc_logits(probs, calib_set_probs, calib_set_labels):
+    label_marginal = np.mean(calib_set_probs, axis=0) # marginalized probs 
+
+    test_label_counter = Counter(calib_set_labels)
+    label_prior = np.array(
+        [freq  for label, freq in sorted(list(test_label_counter.items()))]
+        )/len(calib_set_labels)
+    # label_prior = np.full(len(params['label_dict']), 1/len(params['label_dict']))
+
+    logprobs = np.log(probs)
     label_prior_logprob = np.log(label_prior)
     label_marginal_logprob = np.log(label_marginal)
 
-    calibrated_label_logprob = torch.from_numpy(all_label_logprobs + label_prior_logprob - label_marginal_logprob)
-    calibrated_label_probs = torch.softmax(calibrated_label_logprob, dim=-1)
+    calibrated_logprob = logprobs + label_prior_logprob - label_marginal_logprob
 
-    return calibrated_label_probs.numpy()
+    return calibrated_logprob
 
-def get_bc_probs(all_label_raw_logits, label_raw_logits):
-    label_marginal = np.mean(label_raw_logits, axis=0) # marginalized logits
+def get_bc_logits(logits, calib_set_logits):
+    label_marginal = np.mean(calib_set_logits, axis=0) # marginalized logits
+    calibrated_logits = logits-label_marginal
 
-    calibrated_label_logits = torch.from_numpy(all_label_raw_logits-label_marginal)
-    calibrated_label_probs = torch.softmax(calibrated_label_logits, dim=-1)
+    return calibrated_logits
 
-    return calibrated_label_probs.numpy()
+def get_icc_logits(params, train_sentences, train_labels, probs):
+    semantic_prior = None
+    if params['prompt_shared']:
+        semantic_prior = get_prompt_semantic_prior(params, train_sentences[0], train_labels[0])
 
-def get_tc_probs(params: Dict, sentences: List[str], embeddings: np.ndarray, labels: List[int], original_logits: np.ndarray):
-    if isinstance(original_logits, np.ndarray):
-        original_logits = torch.tensor(original_logits, dtype=torch.float32)
+    calibrated_probs = np.copy(probs)
+    for i in range(len(train_sentences)):
+        cur_semantic_prior = semantic_prior if semantic_prior is not None else get_prompt_semantic_prior(params, train_sentences[i], train_labels[i])        
+        calibrated_probs[i] = probs[i]/cur_semantic_prior
         
-    batch = {"inputs":[], "logits":[]}
-    
-    for i in range(len(sentences)):
-        data = generate_data_class_agnostic(params, sentences[i], embeddings[i], labels[i])
-        batch['inputs'].append(data['inputs'])
-        batch['logits'].append(data['logits'])
-    
-    batch = {
-        "inputs": torch.stack(batch['inputs']),
-        "logits": torch.stack(batch['logits'])
-    }
-    # batch['logits'][:,-1,:] = original_logits
-      
-    params['input_dim'] = batch['inputs'][0].shape[-1]
-    calibrated_logits = transformer_calibrate(params, batch)
-    calibrated_probs = torch.softmax(calibrated_logits, dim=-1)
-    
-    if not torch.equal(torch.argmax(batch['logits'][:,-1,:], dim=-1), torch.argmax(original_logits, dim=-1)):
-        print(f"Shape: {batch['logits'][:,-1,:].shape}, {original_logits.shape}. Logits: {batch['logits'][:,-1,:][-5:, : ]}, {original_logits[-5:, : ]}")
-    # assert torch.equal(torch.argmax(calibrated_logits, dim=-1), torch.argmax(original_logits, dim=-1)), f"Shape: {calibrated_logits.shape}, {original_logits.shape}. Logits: {calibrated_logits[-1:, : ]}, {original_logits[-1:, : ]}"
-    # print(original_logits[-2:,:], calibrated_logits[-2:,:]) ;exit()
-    return calibrated_probs.numpy()
-    
-# Different feature set, made for causal temperature regression
-def generate_data2(params: Dict, sentences: List[str], embeddings: np.ndarray, labels: List[int]):
-    data = {
-        "inputs" : [],
-        "logits": [],
-    }
-    
-    num_classes = len(params['label_dict'])
-    shifted_onehot_labels = np.zeros((len(labels), num_classes)) # T,num_classes
-    shifted_onehot_labels[0] = np.array([1/num_classes]*num_classes)
+    return np.log(calibrated_probs)    # logprobs for logits
 
-    for i in range(len(labels)-1):
-        shifted_onehot_labels[i+1][labels[i]] = 1
     
-    similarity_vectors = np.zeros((len(embeddings), params['tc_input_dim']-2*num_classes))
-    # print(similarity_vectors.shape)
-    similarity_vectors[:, :len(embeddings)] += np.tril(get_similarities(embeddings, embeddings)) # only upper triangular to make it causal
-    # print(similarity_vectors.shape, embeddings.shape, params['tc_input_dim'])
-    
-    # LLM's logits(y|x, C) to be calibrated by transformer's output T
-    train_sentences = [sentences[:sent_idx] for sent_idx in range(len(sentences))]
-    train_labels = [labels[:sent_idx] for sent_idx in range(len(sentences))]
+def get_prompt_semantic_prior(params, sentences, labels):
+    train_sentences = [sentences[:sent_idx] + sentences[sent_idx+1:] for sent_idx in range(len(sentences))]
+    train_labels = [labels[:sent_idx] + labels[sent_idx+1:] for sent_idx in range(len(sentences))]
     test_sentences = [sentences[sent_idx] for sent_idx in range(len(sentences))]
     
-    all_label_probs, all_label_raw_logits = get_results(params, train_sentences, train_labels, test_sentences)
-    # Input to the calibration transformer is a concatenation of t<k shot probs and the similarities
-    # print(all_label_probs.shape, shifted_onehot_labels.shape, similarity_vectors.shape); exit()
-    data['inputs'] = np.array(
-        [
-            np.concat(
-                (all_label_probs[sent_idx], shifted_onehot_labels[sent_idx], similarity_vectors[sent_idx])
-            ) 
-            for sent_idx in range(len(sentences))
-        ]
-    )
-    data['inputs'] = torch.tensor(data['inputs'], dtype=torch.float32)
-    data['logits'] = torch.tensor(all_label_raw_logits, dtype=torch.float32)
-
-    # print(data['inputs'].shape)
-    # exit()
-    return data
-
-# Different feature set, made for causal temperature regression | class agnostic
-def generate_data_class_agnostic(params: Dict, sentences: List[str], embeddings: np.ndarray, labels: List[int]):
-    data = {
-        "inputs" : [],
-        "logits": [],
-    }
+    probs, logits = get_results(params, train_sentences, train_labels, test_sentences)
+    semantic_prior = np.mean(probs, axis=0)
     
-    num_classes = len(params['label_dict'])
-
-    # LLM's logits(y|x, C) to be calibrated by transformer's output T
-    train_sentences = [sentences[:sent_idx] for sent_idx in range(len(sentences))]
-    train_labels = [labels[:sent_idx] for sent_idx in range(len(sentences))]
-    test_sentences = [sentences[sent_idx] for sent_idx in range(len(sentences))]
-    
-    all_label_probs, all_label_raw_logits = get_results(params, train_sentences, train_labels, test_sentences)
-
-    shifted_correctness = np.zeros((len(labels),)) # num_classes, 
-    shifted_correctness[0] = 0.5
-        
-    row_sums = np.sum(all_label_probs, axis=-1, keepdims=True)
-
-    if np.any(row_sums == 0):
-        print("Zero probs in here! :", all_label_probs)
-        print(sentences)
-        print(labels)    
-        
-    # if np.any(row_sums < 0.1):
-    #     print("Near zero probs in here! :", all_label_probs)
-    #     print(sentences)
-    #     print(labels)    
-        
-    probs = all_label_probs/row_sums
-    preds = np.argmax(probs, axis=-1)
-    pred_probs = probs[np.arange(len(preds)), preds]
-    shifted_gt_probs = np.concatenate((
-        np.array([-1]), 
-        probs[np.arange(len(preds)-1), labels[:-1]]
-    )) # exclude last position and shift
-
-    for i in range(len(labels)-1):
-        shifted_correctness[i+1] = int(preds[i]==labels[i])
-
-    # normalized_entropies = np.array([
-    #     probs[sent_idx]@np.log(probs[sent_idx].T) 
-    #     for sent_idx in range(len(sentences))
-    # ]) / np.log(num_classes)
-    normalized_entropies = -(probs@np.log(probs.T + 1e-9)).diagonal() / np.log(num_classes) # (B, num_classes) × (num_classes, B) --> (B, B) --> diagonal elements
-
-    similarity_vectors = np.zeros((len(embeddings), params['tc_input_dim']-4))
-    # print(similarity_vectors.shape)
-    similarity_vectors[:, :len(embeddings)] += np.tril(get_similarities(embeddings, embeddings)) # only upper triangular to make it causal
-    
-    # Input to the calibration transformer is a concatenation of t<k shot probs and the similarities
-    # print(pred_probs.shape, shifted_correctness.shape, similarity_vectors.shape, embeddings.shape)
-
-    data['inputs'] = np.array([
-        np.concatenate((
-            [pred_probs[sent_idx]], 
-            [shifted_correctness[sent_idx]], 
-            [shifted_gt_probs[sent_idx]], 
-            [normalized_entropies[sent_idx]], 
-            similarity_vectors[sent_idx]
-        ))
-        for sent_idx in range(len(sentences))
-    ])
-
-    data['inputs'] = torch.tensor(data['inputs'], dtype=torch.float32)
-    data['logits'] = torch.tensor(all_label_raw_logits, dtype=torch.float32)
-    
-    # print(data['inputs'])
-    # exit()
-    return data
+    return semantic_prior 
 
 def eval_accuracy(all_label_probs, test_labels):
     correctness_list, prob_list = [], []
@@ -542,16 +528,48 @@ def eval_accuracy(all_label_probs, test_labels):
 def args_check(args: Dict):
     if args['subsample_test_set'] is None:
         logger.warning("No test set size provided, will use the ENTIRE dataset for ")
-    calibration_method = args.get('calibration')
-    if calibration_method in ('GC', 'BC', 'GC_unif'):
-        assert args.get('entropy_levels')==['randshared'], "Only shared random ICL prompt supported for now during calibration"
+        
+    calibration_methods = args.get('calibration')
+        
+    if set(calibration_methods).intersection({CalibrationMethods.GC, CalibrationMethods.BC}):
+        assert args.get('entropy_levels')==[EntropyLevels.RANDOM] and args['prompt_shared'], "Only shared random ICL prompt supported for now during calibration"
         assert args.get('calibration_set_size') is not None, "Please provide a \"test\" set size to get label marginal from, for calibration"
         assert args.get('calibration_set_size')>0, "Need non empty test set for calibration"
-
+    if CalibrationMethods.TF in calibration_methods:
+        assert args.get("calibrator_name"), "Please provide the calibrator model name"
+    if args['sampling_strategy']==SamplingStrategy.SIMILARITY:
+        assert args.get('prompt_shared')!=True, "Can not share the in-context examples/prompt when similarity sampling"
+        
+def process_args(args):
+    args['models'] = convert_to_list(args['models'])
+    args['datasets'] = convert_to_list(args['datasets'])
+    args['all_shots'] = convert_to_list(args['all_shots'], int)
+    args['calibration'] = convert_to_list(args['calibration'], lambda method : CalibrationMethods[method.upper()])
+    
+    if args['sampling_strategy']=='similarity':
+        args['sampling_strategy'] = SamplingStrategy.SIMILARITY
+        logger.warning("Entropy levels need will be ignored for similarity sampling. Setting it to None")
+        args['entropy_levels'] = None
+        if 0 in args['all_shots']:
+            logger.warning("Removing 0 shot from similarity sampling.")
+            args['all_shots'].remove(0)
+        
+        disallowed = {CalibrationMethods.BC, CalibrationMethods.GC}
+        args['calibration'] = list(set(args['calibration']) - disallowed)
+                        
+    if args.get('entropy_levels'):
+        args['sampling_strategy'] = SamplingStrategy.ENTROPY
+        args['entropy_levels'] = convert_to_list(args['entropy_levels'], lambda x : EntropyLevels[x.upper()] if x.isalpha() else float(x))
+        if len(args['entropy_levels'])==0:
+            raise ValueError("No entropy levels provided")
+        
+        if set(args['calibration']).intersection({CalibrationMethods.GC, CalibrationMethods.BC}):
+            args['prompt_shared'] = True
+        
 if __name__ == '__main__':
     # vllm stuff
-    # mp.set_start_method('spawn', force=True)
-    # setup_single_threading()
+    # mp.set_start_method('fork', force=True)
+    setup_single_threading()
     setup_vllm_env_settings()
     
     parser = argparse.ArgumentParser()
@@ -569,53 +587,37 @@ if __name__ == '__main__':
                             # default="rand", 
                             # choices=["rand", "rand_shared", "max", "labelspike", "labelsuppress"],
                             help='the levels of entropy for sampling ICL examples')
-    
+    parser.add_argument('--prompt_shared', dest='prompt_shared',  action='store_true', required=False, default=False,
+                            help='Whether or not to use the same in context examples for the batch of test inputs. \
+                                  Not to be used for similarity sampled in context examples.')
     # calibration args
     parser.add_argument('--calibration', dest='calibration', action='store', required=False, 
-                            choices=["GC", "GC_unif", "BC", "TC"],
-                            help='calibration strategy for the ICL prompt')
+                            # choices=["GC", "GC_unif", "BC", "TC"],
+                            help='calibration strategies for the ICL prompt')
+    parser.add_argument('--calibrator_name', dest='calibrator_name', action='store', required=False, help='calibrator model name')
     parser.add_argument('--calibrator_model_path', dest='calibrator_model_path', action='store', required=False, help='calibrator model path')
     parser.add_argument('--calibration_set_size', dest='calibration_set_size', action='store', required=False, type=int,
                             default=100, help='calibration strategy for the ICL prompt')
-    parser.add_argument('--tc_input_dim', dest='tc_input_dim', action='store', required=False, type=int,
-                        default=None, help='calibrator input dims')
     
     # inference args
     parser.add_argument('--subsample_test_set', dest='subsample_test_set', action='store', required=True, type=int,
                         default=None, help='size of test set to use to speed up eval. None means using all test set')
-    parser.add_argument('--api_num_log_prob', dest='api_num_log_prob', action='store', required=False, type=int,
+    parser.add_argument('--api_num_logprob', dest='api_num_log_prob', action='store', required=False, type=int,
                         default=200, help='number of top tokens to ask for when querying the model. Capped at 100 for OpenAI GPT-3 API')
-    parser.add_argument('--bs', dest='bs', action='store', required=False, type=int, default=None,
-                        help='batch size for model queries. For OpenAI API, capped at 20. For local running, set this to max out your GPU memory.')
+    parser.add_argument('--bs', dest='bs', action='store', required=False, type=int, default=None, help='batch size for model queries.')
+    
     # flags
-    parser.add_argument('--use_saved_results', dest='use_saved_results', action='store_const', const=True, default=False,
+    parser.add_argument('--use_saved_results', dest='use_saved_results', action='store_true', default=False,
                         help='whether to load the results from pickle files and not run the model')
     parser.add_argument('--approx', dest='approx', action='store_const', const=True, default=False,
                         help='whether to set token prob to zero if not in top 100')
     
-    parser.add_argument('--half', action='store_true', default=True,
-                        help='Use float 16')
     parser.add_argument('--gpu_id', dest='gpu_id', action='store', default=0, required=False, help='Which CUDA gpu to run model on', type=int)
     
     args = parser.parse_args()
     args = vars(args)
-    # print(args)
 
-    args['models'] = convert_to_list(args['models'])
-    args['datasets'] = convert_to_list(args['datasets'])
-    args['all_shots'] = convert_to_list(args['all_shots'], int)
-    if args.get('entropy_levels'):
-        args['sampling_strategy'] = SamplingStrategy.ENTROPY
-        args['entropy_levels'] = convert_to_list(args['entropy_levels'], lambda x : x if x.isalpha() else float(x))
-        if len(args['entropy_levels'])==0:
-            raise ValueError("No entropy levels provided")
-    if args['sampling_strategy']=='similarity':
-        args['sampling_strategy'] = SamplingStrategy.SIMILARITY
-        logger.warning("Entropy levels need will be ignored for similarity sampling. Setting it to rand")
-        args['entropy_levels'] = ["rand"]
-        if 0 in args['all_shots']:
-            logger.warning("Removing 0 shot from similarity sampling.")
-            args['all_shots'].remove(0)
-
+    process_args(args)
     args_check(args)
+    
     main(**args)

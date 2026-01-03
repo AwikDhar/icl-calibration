@@ -14,7 +14,8 @@ def plot_calibration(
         feature_type: str = None,
         llm_agnostic: bool = False,
         sampling_strategy: str = None,
-        save_path=None
+        save_path=None,
+        plot_gt_calibration=False
     ):
     sns.set_style("whitegrid")
 
@@ -29,11 +30,15 @@ def plot_calibration(
     # ECE plot
     original_ece = [calibration_data.ece_shots_map['original'][shot] for shot in shots]
     calibrated_ece = [calibration_data.ece_shots_map['calibrated'][shot] for shot in shots]
+    dynamic_temp_calibrated_ece = [calibration_data.ece_shots_map['dynamic_temp_calibrated'][shot] for shot in shots]
     static_temp_calibrated_ece = [calibration_data.ece_shots_map['static_temp_calibrated'][shot] for shot in shots]
+    global_temp_calibrated_ece = [calibration_data.ece_shots_map['global_temp_calibrated'][shot] for shot in shots]
     
     ax1.plot(shots, original_ece, label='Original', marker='o', color='r')
     ax1.plot(shots, calibrated_ece, label='Calibrated', marker='o', color='g')
-    ax1.plot(shots, static_temp_calibrated_ece, label='Static Temp Calibrated', marker='o', color='b')
+    ax1.plot(shots, dynamic_temp_calibrated_ece, label='DT Calibrated', marker='o', color='c')
+    ax1.plot(shots, static_temp_calibrated_ece, label='ST Calibrated', marker='o', color='b')
+    ax1.plot(shots, global_temp_calibrated_ece, label='GT Calibrated', marker='o', color='purple') if plot_gt_calibration else None
     
     ax1.set_xlabel('Shots', fontsize=12)
     ax1.set_ylabel('ECE', fontsize=12)
@@ -43,11 +48,16 @@ def plot_calibration(
     # Brier plot
     original_brier = [calibration_data.brier_shots_map['original'][shot] for shot in shots]
     calibrated_brier = [calibration_data.brier_shots_map['calibrated'][shot] for shot in shots]
+    dynamic_temp_calibrated_brier = [calibration_data.brier_shots_map['dynamic_temp_calibrated'][shot] for shot in shots]
     static_temp_calibrated_brier = [calibration_data.brier_shots_map['static_temp_calibrated'][shot] for shot in shots]
+    global_temp_calibrated_brier = [calibration_data.brier_shots_map['global_temp_calibrated'][shot] for shot in shots] if plot_gt_calibration else None
     
     ax2.plot(shots, original_brier, label='Original', marker='o', color='r')
     ax2.plot(shots, calibrated_brier, label='Calibrated', marker='o', color='g')
-    ax2.plot(shots, static_temp_calibrated_brier, label='Static Temp Calibrated', marker='o', color='b')
+    ax2.plot(shots, dynamic_temp_calibrated_brier, label='DT Calibrated', marker='o', color='c')
+    ax2.plot(shots, static_temp_calibrated_brier, label='ST Calibrated', marker='o', color='b')
+    if plot_gt_calibration:
+        ax2.plot(shots, global_temp_calibrated_brier, label='GT Calibrated', marker='o', color='purple')
     
     ax2.set_xlabel('Shots', fontsize=12)
     ax2.set_ylabel('Brier Score', fontsize=12)
@@ -56,25 +66,33 @@ def plot_calibration(
     
     # Temperature plot
     temps = [calibration_data.temp_shots_map[shot] for shot in shots]
+    dynamic_temps = [calibration_data.dynamic_temp_shots_map[shot] for shot in shots]
     static_temps = [calibration_data.static_temp_shots_map[shot] for shot in shots]
+    if plot_gt_calibration:
+        global_temps = [calibration_data.global_temp_shots_map[shot] for shot in shots]
     
     ax3.boxplot(temps, positions=shots, showfliers=False)
+    ax3.plot(shots, dynamic_temps, label='Dynamic Temp', marker='x', color='c', linestyle='--')
     ax3.plot(shots, static_temps, label='Static Temp', marker='x', color='b', linestyle='--')
+    ax3.plot(shots, global_temps, label='Global Temp', marker='x', color='purple', linestyle='--') if plot_gt_calibration else None
     
     ax3.set_xlabel('Shots', fontsize=12)
     ax3.set_ylabel('Temperature ranges', fontsize=12)
     ax3.set_title(f'Calibration temperatures', fontsize=12)
-    # ax3.set_ylim([0, 1.5])
     ax3.legend()
     
     # Accuracy/Confidence plot
     original_conf = [calibration_data.conf_shots_map['original'][shot] for shot in shots]
     calibrated_conf = [calibration_data.conf_shots_map['calibrated'][shot] for shot in shots]
+    dynamic_temp_calibrated_conf = [calibration_data.conf_shots_map['dynamic_temp_calibrated'][shot] for shot in shots]
     static_temp_calibrated_conf = [calibration_data.conf_shots_map['static_temp_calibrated'][shot] for shot in shots]
+    global_temp_calibrated_conf = [calibration_data.conf_shots_map['global_temp_calibrated'][shot] for shot in shots] if plot_gt_calibration else None
     
     ax4.plot(shots, original_conf, label='Original confidence', marker='o', color='r')
     ax4.plot(shots, calibrated_conf, label='Calibrated confidence', marker='o', color='g')
+    ax4.plot(shots, dynamic_temp_calibrated_conf, label='DT calib confidence', marker='o', color='c')
     ax4.plot(shots, static_temp_calibrated_conf, label='ST calib confidence', marker='o', color='b')
+    ax4.plot(shots, global_temp_calibrated_conf, label='GT calib confidence', marker='o', color='purple') if plot_gt_calibration else None
     ax4.plot(shots, calibration_data.accuracies, label='Accuracies', marker='s', color='black')
     
     ax4.set_xlabel('Shots', fontsize=12)

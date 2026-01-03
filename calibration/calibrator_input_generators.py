@@ -164,16 +164,16 @@ def generate_data_class_agnostic_with_embeddings(params: Dict, sentences: List[s
 
     normalized_entropies = -(probs@np.log(probs.T + 1e-9)).diagonal() / np.log(num_classes) # (B, num_classes) × (num_classes, B) --> (B, B) --> diagonal elements
 
-    similarity_vectors = np.tril(get_similarities(embeddings, embeddings)) # only lower triangular to make it causal
+    input_similarity_vectors = np.tril(get_similarities(embeddings, embeddings)) # only lower triangular to make it causal
     
     lower_dim_embeddings = get_embeddings(params, sentences)
     
     T = len(sentences) # number of timesteps
-    js_similarity_vectors = np.zeros((T, T))
+    pred_similarity_vectors = np.zeros((T, T))
     for timestep in range(T):
         for prev_timestep in range(timestep + 1):  # only compute for j <= i (causal)
             js_div = js_divergence(probs[timestep], probs[prev_timestep])
-            js_similarity_vectors[timestep, prev_timestep] = 1 - (js_div / np.log(2))  # Maps [0, log(2)] → [1, 0]
+            pred_similarity_vectors[timestep, prev_timestep] = 1 - (js_div / np.log(2))  # Maps [0, log(2)] → [1, 0]
 
     # Input to the calibration transformer is a concatenation of t<k shot probs, similarities and other features
     data['inputs'] = [
@@ -182,8 +182,8 @@ def generate_data_class_agnostic_with_embeddings(params: Dict, sentences: List[s
             [shifted_features.correctness[sent_idx]], 
             [shifted_features.gt_probs[sent_idx]], 
             [normalized_entropies[sent_idx]],
-            js_similarity_vectors[sent_idx], 
-            similarity_vectors[sent_idx],
+            pred_similarity_vectors[sent_idx], 
+            input_similarity_vectors[sent_idx],
             lower_dim_embeddings[sent_idx]
         )).tolist()
         for sent_idx in range(len(sentences))
@@ -207,9 +207,9 @@ def get_autoregressive_results(params: Dict, sentences: List[str], labels: List[
     train_labels = [labels[:sent_idx] for sent_idx in range(len(sentences))]
     test_sentences = [sentences[sent_idx] for sent_idx in range(len(sentences))]
     
-    all_label_probs, all_label_raw_logits = get_results(params, train_sentences, train_labels, test_sentences)
+    probs, logits = get_results(params, train_sentences, train_labels, test_sentences)
     
-    return all_label_probs, all_label_raw_logits
+    return probs, logits
 
 def get_shifted_features(probs, preds, labels):
     shifted_gt_probs = np.concatenate((

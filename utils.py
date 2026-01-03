@@ -1,5 +1,8 @@
+from vllm import LLM, SamplingParams
+
 import inspect
 import json
+from pathlib import Path
 import numpy as np
 from copy import deepcopy
 import os
@@ -9,28 +12,33 @@ import random
 from typing import Callable, List, Dict
 from collections import Counter
 
-from vllm import LLM, SamplingParams
 from transformers import AutoTokenizer, AutoModelForCausalLM, EetqConfig
 import torch
 from sentence_transformers import SentenceTransformer
+from gemini.gemini_model import GeminiModel
 
-from calibration.model import CalibrationTransformer
+from calibration.model import CalibrationTransformer, PositionEmbeddingType
+from calibration.temperature import get_equivalent_temp, get_equivalent_temp_gd, get_shotwise_dynamic_temperatures
+
 from labels_trie import LabelsTrie
-
-# import transformers
-# transformers.logging.set_verbosity_error()
+from llm_framework import LlmFramework
+from sampling_strategies import EntropyLevels
 
 import logging
 logger = logging.getLogger(__name__)
 
-ROOT_DIR = os.path.dirname(os.path.realpath(__file__))
-SAVE_DIR = os.path.join(ROOT_DIR, 'saved_results')
+ROOT_DIR = Path(__file__).resolve().parent
+SAVE_DIR = ROOT_DIR/"saved_results"
+
 if not os.path.isdir(SAVE_DIR):
     os.mkdir(SAVE_DIR)
-    print(f"mkdir at {SAVE_DIR} for saving results")
-from data_utils import SampledData 
+    print(f"Created {SAVE_DIR} for saving results")
 
-use_vllm = True
+logging.getLogger('urllib3').setLevel(logging.ERROR)
+logging.getLogger('httpx').setLevel(logging.ERROR)
+logging.getLogger('httpcore').setLevel(logging.ERROR)
+
+llm_framework = LlmFramework.VLLM
 infer_model = None
 compile = False
 infer_tokenizer = None
@@ -67,7 +75,7 @@ def get_test_data(sentences, labels, embeddings, count=None):
             logger.error(f"Found only {len(sentences)} available test inputs against a request of {count} "
                             "test inputs, will only use the available ones")
             count = len(sentences)
-        # np.random.seed(0)
+
         test_sentences, test_labels, test_embeddings = random_test_sampling(sentences, labels, embeddings, count)
         logger.info(f"selecting {len(test_labels)} subsample of test set")
 
@@ -136,9 +144,9 @@ def random_sampling(sentences, labels, num, entropy_level, test_label=None):
             )
         idxs = random.sample(idx0, neg_label_count) + random.sample(idx1, num-neg_label_count)   
         random.shuffle(idxs)  
-    elif isinstance(entropy_level, str) and num>=1:
+    elif isinstance(entropy_level, EntropyLevels) and num>=1:
         match entropy_level:
-            case "max":
+            case EntropyLevels.MAX:
                 per_label_count = num//num_classes
                 remainder = num % num_classes
 
@@ -154,9 +162,9 @@ def random_sampling(sentences, labels, num, entropy_level, test_label=None):
                     for label in extra_labels:
                         idxs.extend(random.sample(idx_label_map[label], 1))
                 random.shuffle(idxs)  
-            case "rand" | "randshared":
+            case EntropyLevels.RANDOM:
                 idxs = np.random.choice(len(labels), size=num, replace=False)
-            case "labelspike":
+            case EntropyLevels.LABELSPIKE:
                 test_label_idxs = [i for i, lb in enumerate(labels) if lb==test_label]
                 other_label_idxs = [i for i, lb in enumerate(labels) if lb!=test_label]
 
@@ -165,7 +173,7 @@ def random_sampling(sentences, labels, num, entropy_level, test_label=None):
                 rem_idxs = list(set(test_label_idxs)-set(idxs)) + other_label_idxs
                 idxs.extend(random.sample(rem_idxs, num-len(idxs)))
                 random.shuffle(idxs)  
-            case "labelsuppress":
+            case EntropyLevels.LABELSUPPRESS:
                 test_label_idxs = [i for i, lb in enumerate(labels) if lb==test_label]
                 other_label_idxs = [i for i, lb in enumerate(labels) if lb!=test_label]
                 
@@ -192,15 +200,15 @@ def random_sampling_check(selected_labels: List[int], entropy_level, num_classes
     label_counts_map = Counter(selected_labels)
 
     match entropy_level:
-        case "max":
+        case EntropyLevels.MAX:
             if len(selected_labels)==1: # no "balanced distribution" for 1 shot, it'll be balanced on avg
                 return
             label_counts = label_counts_map.values()
             target = int(len(selected_labels) > num_classes) # only when k-shot is more than num_classes there can be 1 extra ex in some class
             assert max(label_counts) - min(label_counts) <= target, f"Max entropy sampling logic seems to be wrong. label counts: {label_counts}, target:{target}"
-        case "labelspike":
+        case EntropyLevels.LABELSPIKE:
             assert label_counts_map[test_label]>=round(len(selected_labels)/2), "Label ain't spiking"
-        case "labelsuppress":
+        case EntropyLevels.LABELSUPPRESS:
             assert label_counts_map[test_label]<=len(selected_labels)-round(len(selected_labels)/2), "Label ain't supppressing"
             
 def similarity_sampling(
@@ -224,14 +232,14 @@ def similarity_sampling(
             np.random.shuffle(idx_row)
     else:
         top_idxs = np.flip(top_idxs, axis=-1) # the test sentence stays at the last position instead of 1st
+    
+    from data_utils import SampledData 
         
     sampled_data = SampledData()
     sampled_data.sentences = [[sentences[j] for j in idx_row] for idx_row in top_idxs]
     sampled_data.labels = [[labels[j] for j in idx_row] for idx_row in top_idxs]
 
-    # if num_shots==3:
-    #     print(train_sentences[1], test_sentences[1])
-    #     exit()
+    # if num_shots==3: print(sentences[1], test_sentences[1]); exit()
     if return_embeddings:
         sampled_data.embeddings = np.array([[sentence_embeddings[j] for j in idx_row] for idx_row in top_idxs])
     return sampled_data
@@ -248,7 +256,9 @@ def setup_embedding_model(params: Dict):
     global gpu_id
     
     if embedding_model is None:
-        embedding_model = SentenceTransformer(f"{params['embedding_model']}", device=f'cuda:{gpu_id}', truncate_dim=params['embedding_dim'], cache_folder=os.environ['HF_HOME'], model_kwargs={'torch_dtype':torch.bfloat16})
+        model_name = params.get('embedding_model', 'google/embeddinggemma-300m')
+        truncate_dim = params.get('embedding_dim', 128)
+        embedding_model = SentenceTransformer(f"{model_name}", device=f'cuda:{gpu_id}', truncate_dim=truncate_dim, cache_folder=os.environ['HF_HOME'], model_kwargs={'torch_dtype':torch.bfloat16})
     
 # Get embeddings of sentences at a specified truncated dim. 
 # Full embeddings for similarity sampling, truncated embeddings for calibrator features for easier learning 
@@ -290,93 +300,104 @@ def js_divergence(p, q, epsilon=1e-9):
     
     return 0.5 * kl_divergence(p, m) + 0.5 * kl_divergence(q, m)
 
+def get_llm_framework(model_name: str):    
+    if 'gemini' in model_name:
+        llm_framework = LlmFramework.GOOGLE
+    else:
+        llm_framework = LlmFramework.VLLM
 
+    return llm_framework
+            
 def setup_llm(model_name, num_log_probs = 1000, gpu_id_=0):
     global infer_model
-    global infer_tokenizer
     global gpu_id
-    global use_vllm
+    global llm_framework
     
     if infer_model is None:
+        llm_framework = get_llm_framework(model_name)
+
         gpu_id = gpu_id_
         device = f'cuda:{gpu_id}'
 
         cache_dir = os.environ.get('HF_HOME')
-        model_type = 'vllm' if use_vllm else 'HF' 
         
-        logger.info(f"Setting up {model_type} model: {model_name} with cache dir: {cache_dir}")
+        logger.info(f"Setting up {llm_framework.name} model: {model_name} with cache dir: {cache_dir}")
 
-        if use_vllm:
-            # Configure vLLM model
-            os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
-            infer_model = LLM(
-                model=model_name,
-                # tensor_parallel_size=2,
-                max_model_len=40000,
-                # quantization='fp8',
-                seed=42,
-                # enable_chunked_prefill=False,  # Disable chunked prefill
-                max_num_seqs=1,  # Force sequential processing
-                # enable_prefix_caching=False,
-                # enforce_eager=True,
-                limit_mm_per_prompt={"image": 0}, # to skip initialization of vision tower of multimodel models
-                max_logprobs=num_log_probs,
-                download_dir=cache_dir,
-                gpu_memory_utilization=0.85
-            )
-            del os.environ['CUDA_VISIBLE_DEVICES']
-            logger.info(f"Loaded {model_name} via vllm")
-        else:
+        match llm_framework:
+            case LlmFramework.GOOGLE:
+                infer_model = GeminiModel(model_name=model_name)
             
-            attn_implementation="kernels-community/vllm-flash-attn3"
-            # attn_implementation="flash_attention_2"
-            quantization_config = EetqConfig("int8")
-
-            infer_model = AutoModelForCausalLM.from_pretrained(model_name, use_cache=False, trust_remote_code=True, #torch_dtype=torch.bfloat16,
-                                                            quantization_config=quantization_config, device_map=device, #tp_plan="auto",
-                                                            attn_implementation=attn_implementation, cache_dir=cache_dir)
-            if compile:
-                torch._dynamo.config.automatic_dynamic_shapes = False
-                torch._dynamo.config.assume_static_by_default = True
-                torch._dynamo.config.cache_size_limit = 64  # Increase cache
-                torch.backends.cuda.matmul.allow_tf32 = True
-                torch.backends.cudnn.allow_tf32 = True
-                torch._dynamo.config.capture_scalar_outputs = True 
-                torch._inductor.config.coordinate_descent_tuning = True
-                torch._inductor.config.triton.unique_kernel_names = True
-                torch._inductor.config.fx_graph_cache = True  # Enable graph caching
-                torch._inductor.config.triton.cudagraph_skip_dynamic_graphs=True
-
-                # Compile with max-autotune for best kernel selection
-                infer_model = torch.compile(
-                    infer_model,
-                    mode="max-autotune",  # Searches for best CUDA kernels
-                    fullgraph=False,  # True if model supports it
-                    dynamic=True
+            case LlmFramework.VLLM:
+                os.environ['CUDA_VISIBLE_DEVICES'] = str(gpu_id)
+                infer_model = LLM(
+                    model=model_name,
+                    # tensor_parallel_size=1,
+                    max_model_len=40000,
+                    quantization='fp8',
+                    seed=42,
+                    # enable_chunked_prefill=False,  
+                    max_num_seqs=1,  # Force sequential processing
+                    # enable_prefix_caching=False,
+                    # enforce_eager=True,
+                    limit_mm_per_prompt={"image": 0}, # to skip initialization of vision tower of multimodel models
+                    max_logprobs=num_log_probs,
+                    download_dir=cache_dir,
+                    gpu_memory_utilization=0.9,
+                    trust_remote_code=True
                 )
-                # infer_model.config.max_position_embeddings = 3048
-                # infer_model.config.output_hidden_states = True
-                # infer_model = torch.compile(infer_model, mode="max-autotune", fullgraph=False, dynamic=False)
-            infer_model.eval()
-        
-        infer_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, device_map=device, cache_dir=cache_dir)
- 
-        # to batch generation, we pad on the left and mask those positions out.
-        infer_tokenizer.padding_side = "left"
-        infer_tokenizer.pad_token = infer_tokenizer.eos_token
-        if isinstance(infer_tokenizer.eos_token_id, list):
-            # Use the first EOS token ID
-            logger.info("EOS token ids: " + str(infer_tokenizer.eos_token_id))
-            infer_tokenizer.pad_token_id = infer_tokenizer.eos_token_id[-1]
-            # infer_model.config.pad_token_id = infer_model.config.eos_token_id[-1]
-        else:
-            infer_tokenizer.pad_token_id = infer_tokenizer.eos_token_id
-            # infer_model.config.pad_token_id = infer_model.config.eos_token_id
+                del os.environ['CUDA_VISIBLE_DEVICES']
+                setup_tokenizer(model_name, device, cache_dir)
+                
+                logger.info(f"Loaded {model_name} via vllm")
+            
+            case LlmFramework.HF:
+                
+                attn_implementation="kernels-community/vllm-flash-attn3"
+                quantization_config = EetqConfig("int8")
+
+                infer_model = AutoModelForCausalLM.from_pretrained(model_name, use_cache=False, trust_remote_code=True, #torch_dtype=torch.bfloat16,
+                                                                quantization_config=quantization_config, device_map=device, #tp_plan="auto",
+                                                                attn_implementation=attn_implementation, cache_dir=cache_dir)
+                if compile:
+                    torch._dynamo.config.automatic_dynamic_shapes = False
+                    torch._dynamo.config.assume_static_by_default = True
+                    torch._dynamo.config.cache_size_limit = 64  # Increase cache
+                    torch.backends.cuda.matmul.allow_tf32 = True
+                    torch.backends.cudnn.allow_tf32 = True
+                    torch._dynamo.config.capture_scalar_outputs = True 
+                    torch._inductor.config.coordinate_descent_tuning = True
+                    torch._inductor.config.triton.unique_kernel_names = True
+                    torch._inductor.config.fx_graph_cache = True  # Enable graph caching
+                    torch._inductor.config.triton.cudagraph_skip_dynamic_graphs=True
+
+                    # Compile with max-autotune for best kernel selection
+                    infer_model = torch.compile(
+                        infer_model,
+                        mode="max-autotune", 
+                        fullgraph=False,  
+                        dynamic=True
+                    )
+                    
+                infer_model.eval()
+                setup_tokenizer(model_name, device, cache_dir)
 
         logger.info("Finished loading model")
-        
-    # return infer_model, infer_tokenizer
 
+def setup_tokenizer(model_name, device, cache_dir):
+    global infer_tokenizer
+    
+    infer_tokenizer = AutoTokenizer.from_pretrained(model_name, trust_remote_code=True, device_map=device, cache_dir=cache_dir)
+ 
+    # to batch generation, we pad on the left and mask those positions out.
+    infer_tokenizer.padding_side = "left"
+    infer_tokenizer.pad_token = infer_tokenizer.eos_token
+    if isinstance(infer_tokenizer.eos_token_id, list):
+        # Use the first EOS token ID
+        logger.info("EOS token ids: " + str(infer_tokenizer.eos_token_id))
+        infer_tokenizer.pad_token_id = infer_tokenizer.eos_token_id[-1]
+    else:
+        infer_tokenizer.pad_token_id = infer_tokenizer.eos_token_id
+        
 def setup_calibrator(params):
     global calibrator
     global gpu_id
@@ -390,19 +411,31 @@ def setup_calibrator(params):
         context_length=config['context_length'], 
         embedding_dim=config['embedding_dim'], 
         num_heads=config['num_heads'], 
-        num_layers=config['num_layers']
+        num_layers=config['num_layers'],
+        pos_embedding_type=PositionEmbeddingType.Sinusoidal
     ).to(device)
     
     model_path = params.get('calibrator_model_path')
+    # if model_path is None:
+    #     if params['llm_agnostic']:
+    #         model_dir = f"./calibration/models/llm_agnostic"
+    #     else:
+    #         model_dir = f"./calibration/models/{params['model'].replace('/','_')}"
+            
+    #     # if sampling_strategy:
+    #     #     model_dir += f"/{sampling_strategy}"
+            
+    #     model_path = f'{model_dir}/{params['calibrator_name']}'
+        
     if model_path is None:
-        model_path = f"./calibration/models/{params['model'].replace('/','_')}/{params['dataset']}/calibrator"
+        model_path = f"./calibration/models/llm_agnostic/{params['calibrator_name']}"
 
     state_dict = torch.load(model_path, weights_only=True)
     calibrator.load_state_dict(state_dict)
     
     return calibrator.to(device)
 
-def transformer_calibrate(params:Dict, data: Dict):
+def transformer_calibrate(params:Dict, inputs: torch.Tensor, logits: torch.Tensor):
     # global gpu_id
     global calibrator
     if calibrator is None:
@@ -411,22 +444,60 @@ def transformer_calibrate(params:Dict, data: Dict):
     
     calibrator.eval()
     with torch.no_grad():
-        inputs, logits = data['inputs'].to(device), data['logits'].to(device) # len(eval),T,C | len(eval),T,num_classes | len(eval),T
+        inputs = inputs.to(device) # len(eval),T,C | len(eval),T,num_classes | len(eval),T
+        logits = logits.to(device)
         
-        temperatures = calibrator(inputs) # B,T,1
-        calibrated_logits = logits*temperatures # B,T,num_classes
+        B, num_classes = logits.shape
         
-        original_argmax = torch.argmax(logits, dim=-1)
-        calibrated_argmax = torch.argmax(calibrated_logits, dim=-1)
-        if not torch.all(original_argmax == calibrated_argmax):
-            mismatch_mask = original_argmax != calibrated_argmax
-            print(f"Argmax mismatches at {mismatch_mask.sum()} positions")
-            print(f"Original logits at mismatches: {logits[mismatch_mask]}")
-            print(f"Calibrated logits at mismatches: {calibrated_logits[mismatch_mask]}")
-            print(f"Temperatures at mismatches: {temperatures[mismatch_mask]}")
-            raise AssertionError("Argmax changed after calibration")        
+        calibrated_pred_probs = calibrator(inputs) # B,T,1
+        calibrated_pred_probs = torch.clamp(calibrated_pred_probs, min=1/num_classes + 2e-2, max = 1.0 - 2e-2)
+    
+    temperatures = get_equivalent_temp_gd(logits.view(B, 1, num_classes), calibrated_pred_probs[:, [-1], :])  # (B, 1, num_classes) (B, 1, 1)
+    temperatures = torch.nan_to_num(temperatures, nan=1.0)
+    calibrated_logits = logits*temperatures[:, -1, :] # (B, num_classes) * (B,1)
+    
+    print(temperatures.mean().item(), temperatures.min().item(), temperatures.max().item())
+    print(calibrated_pred_probs.mean().item(), calibrated_pred_probs.min().item(), calibrated_pred_probs.max().item(), calibrated_pred_probs.std().item())
+    calibrated_probs = calibrated_logits.softmax(dim=-1).max(dim=-1).values
+    print(calibrated_probs.mean().item(), calibrated_probs.min().item(), calibrated_probs.max().item(), calibrated_probs.std().item())
+    print(temperatures[:, -1, :].shape, logits.shape)
         
-        return calibrated_logits[:,-1,:].cpu()        
+    return calibrated_logits
+
+def transformer_calibrate_tmp(params:Dict, inputs: torch.Tensor, logits: torch.Tensor):
+    # global gpu_id
+    global calibrator
+    if calibrator is None:
+        setup_calibrator(params)
+    device=f'cuda:{gpu_id}'
+    
+    calibrator.eval()
+    with torch.no_grad():
+        inputs = inputs.to(device) # len(eval),T,C | len(eval),T,num_classes | len(eval),T
+        logits = logits.to(device)
+        
+        B, T, num_classes = logits.shape
+        
+        calibrated_pred_probs = calibrator(inputs) # B,T,1
+        calibrated_pred_probs = torch.clamp(calibrated_pred_probs, min=1/num_classes + 2e-2, max = 1.0 - 2e-2)
+    
+        temperatures = get_equivalent_temp(logits, calibrated_pred_probs)  # (B, 1, num_classes) (B, 1, 1)
+        temperatures = torch.nan_to_num(temperatures, nan=1.0)
+        calibrated_logits = logits*temperatures # (B, num_classes) * (B,1)
+        
+        print(temperatures[:, -1, :].mean().item(), temperatures[:, -1, :].min().item(), temperatures[:, -1, :].max().item())
+        print(calibrated_pred_probs[:, -1, :].mean().item(), calibrated_pred_probs[:, -1, :].min().item(), calibrated_pred_probs[:, -1, :].max().item(), calibrated_pred_probs[:, -1, :].std().item())
+        
+        calibrated_probs, calibrated_preds = torch.nn.functional.softmax(calibrated_logits, dim=-1).max(dim=-1)
+        print(calibrated_probs[:, -1].mean().item(), calibrated_probs[:, -1].min().item(), calibrated_probs[:, -1].max().item(), calibrated_probs[:, -1].std().item())
+        
+        # print(temperatures.mean().item(), temperatures.min().item(), temperatures.max().item())
+        # print(calibrated_pred_probs.mean().item(), calibrated_pred_probs.min().item(), calibrated_pred_probs.max().item(), calibrated_pred_probs.std().item())
+        # calibrated_probs = calibrated_logits.softmax(dim=-1).max(dim=-1).values
+        # print(calibrated_probs.mean().item(), calibrated_probs.min().item(), calibrated_probs.max().item(), calibrated_probs.std().item())
+        # print(temperatures[:, -1, :].shape, logits.shape)
+        
+    return calibrated_logits[:, -1, :]
 
 def complete_generation_hf(prompts, num_log_probs=None):
     ''' This function runs GPT-2 locally but places the outputs into an json that looks just like the one
@@ -565,14 +636,7 @@ def complete_generation_vllm(prompts, num_log_probs=None):
     if isinstance(prompts, str):
         prompts = [prompts]  # the code below assumes a list
     # print(prompts[0]), exit()
-    # if infer_tokenizer.chat_template is not None:
-    #     messages = [[{"role": "user", "content": prompt}] for prompt in prompts]
-    #     kwargs = {}
-    #     if 'enable_thinking' in inspect.signature(infer_tokenizer.apply_chat_template).parameters:
-    #         kwargs = {'enable_thinking': False}
-    #     # prompts = infer_tokenizer.apply_chat_template(messages, continue_final_message=True, tokenize=False, **kwargs)
-    #     prompts = infer_tokenizer.apply_chat_template(messages, continue_final_message=False, add_generation_prompt=True, tokenize=False, **kwargs)
-    
+
     # Configure sampling parameters for single token generation
     sampling_params = SamplingParams(
         temperature=0.0,  # Greedy sampling (equivalent to argmax)
@@ -581,7 +645,6 @@ def complete_generation_vllm(prompts, num_log_probs=None):
         prompt_logprobs=None,  # We don't need prompt logprobs
         skip_special_tokens=True,
         seed=42,
-        
     )
     
     # Generate using vLLM
@@ -609,7 +672,7 @@ def complete_generation_vllm(prompts, num_log_probs=None):
             
             if generated_token.logprobs:
                 # Get logprobs for the generated token
-                token_logprobs = generated_token.logprobs[0]  # First (and only) generated token
+                token_logprobs = generated_token.logprobs[0]  # Logprobs of first (and only) generated token
                 # print(token_logprobs); exit()
                 # Extract top token and its logprob
                 top_tokens = list(token_logprobs.keys())
@@ -647,21 +710,111 @@ def complete_generation_vllm(prompts, num_log_probs=None):
     return_json['choices'] = choices
     return return_json
 
-def complete(prompt, temp=0, num_log_probs=None):
-    """complete the prompt using a language model"""
-    global use_vllm
+def complete_generation_google(prompts, num_log_probs=None):    
+    if isinstance(prompts, str):
+        prompts = [prompts]
+    
+    return_json = {}
+    choices = []
+    
+    for prompt in prompts:
+        curr_json = {}
+        
+        response = infer_model.generate(prompt=prompt, num_log_probs=num_log_probs)
+        
+        curr_json['text'] = response.text
+        
+        # Handle logprobs if requested
+        if num_log_probs is not None:
+            curr_json['logprobs'] = {}
+            curr_json['logprobs']['top_logprobs'] = []
+            curr_json['logprobs']['token_logprobs'] = []
+            curr_json['logprobs']['tokens'] = []
+            curr_json['logprobs']['hidden_states'] = []
+            curr_json['logprobs']['token_logits'] = []
+            
+            # Access logprobs from response
+            if hasattr(response, 'candidates') and response.candidates:
+                candidate = response.candidates[0]
+                
+                # Check for logprobs_result
+                if hasattr(candidate, 'logprobs_result') and candidate.logprobs_result:
+                    logprobs_result = candidate.logprobs_result
+                    
+                    # Process top candidates for the generated token
+                    if hasattr(logprobs_result, 'top_candidates') and logprobs_result.top_candidates:
+                        # Get the first (and only) token's logprobs
+                        token_candidates = logprobs_result.top_candidates[0].candidates
+                        
+                        # Find the top token (highest logprob)
+                        if token_candidates:
+                            top_candidate = max(token_candidates, key=lambda x: x.log_probability)
+                            
+                            # Store top token
+                            curr_json['logprobs']['tokens'].append(top_candidate.token)
+                            curr_json['logprobs']['token_logprobs'].append(top_candidate.log_probability)
+                            
+                            # Create dictionaries for all top tokens
+                            temp = {}
+                            temp_logits = {}
+                            
+                            # Collect all logprobs for normalization
+                            all_logprobs = [token_candidate.log_probability for token_candidate in token_candidates]
+                            
+                            # Calculate log_sum_exp for stable softmax
+                            max_logprob = max(all_logprobs)
+                            log_sum_exp = max_logprob + np.log(
+                                sum(np.exp(lp - max_logprob) for lp in all_logprobs)
+                            )
+                            
+                            # Populate dictionaries
+                            for candidate in token_candidates:
+                                token_str = candidate.token
+                                if token_str not in temp:
+                                    # Normalized log probability
+                                    temp[token_str] = candidate.log_probability - log_sum_exp
+                                    # Raw log probability as "logit"
+                                    temp_logits[token_str] = candidate.log_probability
+                            
+                            curr_json['logprobs']['top_logprobs'].append(temp)
+                            curr_json['logprobs']['token_logits'].append(temp_logits)
+                            curr_json['logprobs']['hidden_states'].append(None)    
+                        else:
+                            # No candidates, add empty entries
+                            print("No cand")
+                            print(logprobs_result.top_candidates)
+                    else:
+                        # No top_candidates, add empty entries
+                        print("No top cand")
+                        print(response)
+                else:
+                    # No logprobs_result, add empty entries
+                    print("No logprob")
+            else:
+                # No candidates, add empty entries
+                print("No candd")
 
-    assert temp >= 0
-  
-    if use_vllm:
-        return complete_generation_vllm(prompt, num_log_probs=num_log_probs)
-    else:
-        return complete_generation_hf(prompt, num_log_probs=num_log_probs)
+        choices.append(curr_json)
+    return_json['choices'] = choices
+    # print(return_json); exit()
+    return return_json
+
+def complete_generation(prompt, num_log_probs=None):
+    """complete the prompt using a language model"""
+    global llm_framework
+     
+    match llm_framework:
+        case LlmFramework.GOOGLE:
+            return complete_generation_google(prompt, num_log_probs=num_log_probs)
+        case LlmFramework.VLLM:
+            return complete_generation_vllm(prompt, num_log_probs=num_log_probs)
+        case LlmFramework.HF:
+            return complete_generation_hf(prompt, num_log_probs=num_log_probs)
 
 def construct_prompt(params, train_sentences, train_labels, test_sentence):
     global infer_tokenizer
     
-    if infer_tokenizer.chat_template is not None:
+    if infer_tokenizer and infer_tokenizer.chat_template is not None:
         return construct_chat_prompt(params, train_sentences, train_labels, test_sentence)    
     else:
         return construct_base_prompt(params, train_sentences, train_labels, test_sentence)
@@ -708,10 +861,8 @@ def construct_chat_prompt(params, train_sentences, train_labels, test_sentence):
     if 'enable_thinking' in inspect.signature(infer_tokenizer.apply_chat_template).parameters:
         kwargs = {'enable_thinking': False}
     prompt = infer_tokenizer.apply_chat_template(messages, continue_final_message=True, tokenize=False, **kwargs)
-    # prompt = infer_tokenizer.apply_chat_template(messages, continue_final_message=False, add_generation_prompt=True, tokenize=False, **kwargs)
     
-    return prompt
-    
+    return prompt   
 
 def populate_trie_recursive(prompt_prefix, path, label_trie, params):
     """Recursively generate and populate trie with logits for all branches"""
@@ -729,7 +880,7 @@ def populate_trie_recursive(prompt_prefix, path, label_trie, params):
         token_logits = {child_token : 10} 
     else:
         # Generate next token to get logits
-        resp = complete([prompt_prefix], num_log_probs=params['api_num_log_prob'])
+        resp = complete_generation([prompt_prefix], num_log_probs=params['api_num_log_prob'])
         token_logits = resp['choices'][0]['logprobs']['token_logits'][0]
         # if len(path)==0: 
         #     print(token_logits)
@@ -746,14 +897,16 @@ def populate_trie_recursive(prompt_prefix, path, label_trie, params):
 def get_results(params, train_sentences, train_labels, test_sentences):
     """Get results for multi-token labels"""
     setup_llm(params['model'], params['api_num_log_prob'], gpu_id_=params['gpu_id'])
-
+    global llm_framework
+    params['llm_framework'] = llm_framework
+    
     all_label_probs = []
     all_label_raw_logits = []    # will be filled with logprobs 
     
     for i, test_sentence in enumerate(test_sentences):
         prompt = construct_prompt(params, train_sentences[i], train_labels[i], test_sentence)
-        # if len(train_labels[i])==8:
-        #     print(prompt); exit()
+        # if len(train_labels[i])==2:
+        #     print([prompt]); exit()
         # print(prompt)
         # Create fresh trie for this test instance
         label_trie = LabelsTrie(params['label_dict'])
@@ -790,7 +943,9 @@ def load_pickle(params):
     print(f"Loaded data from {file_name}")
     return data
 
-def print_results(tree, names=('Original Accuracy  ','Calibrated Accuracy'), log:Callable = print):
+def print_results(tree, calibration_methods=[], log:Callable = print):
+    calibration_methods = [method.name for method in calibration_methods]
+    
     # print out all results
     root = deepcopy(tree)
 
@@ -804,35 +959,33 @@ def print_results(tree, names=('Original Accuracy  ','Calibrated Accuracy'), log
                 log(f"\nEntropy level: {entropy_level}")
                 num_shots_node = entropy_node[entropy_level]
                 for num_shots in num_shots_node.keys():
-                    accuracies = np.array(list(num_shots_node[num_shots].values()))
-                    if len(accuracies) == 0:
+                    seeds_results = num_shots_node[num_shots]
+                    metrics = np.array(list(seeds_results.values()))
+                    # print(dataset, model, entropy_level, num_shots_node, metrics); exit()
+                    if len(metrics) == 0:
                         continue
-                    accuracies_mean = np.mean(accuracies, axis=0)
-                    accuracies_low = np.min(accuracies, axis=0)
-                    accuracies_high = np.max(accuracies, axis=0)
-                    accuracies_std = np.std(accuracies, axis=0)
+                    metrics_mean = np.mean(metrics, axis=0)
+                    metrics_low = np.min(metrics, axis=0)
+                    metrics_high = np.max(metrics, axis=0)
+                    metrics_std = np.std(metrics, axis=0)
 
-                    if isinstance(num_shots, str)  and 'ece' in num_shots:
-                        names = ('Original ECE', 'Calibrated ECE')
-                    elif isinstance(num_shots, str)  and 'diff' in num_shots:
-                        names = ('Conf diff', )
-                    elif isinstance(num_shots, str)  and 'norm' in num_shots:
-                        names = ('Feature norm', 'Calibrated norm')
-                    elif isinstance(num_shots, str)  and 'temp' in num_shots:
-                        names = ('Best tempture', 'Specific')
-                    elif isinstance(num_shots, str)  and 'entropy' in num_shots:
-                        names = ('Entropy', 'Calibrated entropy')
-                    elif isinstance(num_shots, str)  and 'conf' in num_shots:
-                        names = ('Confidence', 'Calibrated confidence')
+                    # Determine metric names based on num_shots key
+                    if isinstance(num_shots, str):
+                        if 'ece' in num_shots:
+                            names = ['Original ECE'] + [f'{method} ECE' for method in calibration_methods]
+                        elif 'entropy' in num_shots:
+                            names = ['Entropy'] + [f'{method} entropy' for method in calibration_methods]
+                        elif 'conf' in num_shots:
+                            names = ['Confidence'] + [f'{method} confidence' for method in calibration_methods]
                     else:
-                        names = ('Original Accuracy','Calibrated Accuracy')
-                        log(f"\n{num_shots}-shot, {entropy_level} ICL entropy, {len(accuracies)} seeds")
+                        names = ['Original Accuracy'] + [f'{method} Accuracy' for method in calibration_methods]
+                        log(f"\n{num_shots}-shot, {entropy_level} ICL entropy, {len(metrics)} seeds")
                     
                     # for aligned | char
                     max_len = max(len(name) for name in names)
                     names = [name + ' '*(max_len-len(name)) for name in names]
 
-                    for i, (m, l, h, s) in enumerate(zip(accuracies_mean, accuracies_low, accuracies_high, accuracies_std)):
+                    for i, (m, l, h, s) in enumerate(zip(metrics_mean, metrics_low, metrics_high, metrics_std)):
                         log(f"{names[i]} | Mean: {m:.4f}, Low: {l:.4f}, High: {h:.4f}, Std: {s:.4f}")
                     print()
 
@@ -865,10 +1018,11 @@ def setup_single_threading():
     os.environ['NUMEXPR_NUM_THREADS'] = '1'
 
     # Set torch to use single thread
-    # torch.set_num_threads(1)
+    torch.set_num_threads(1)
     
 def setup_vllm_env_settings():    
     # os.environ['VLLM_ENABLE_V1_MULTIPROCESSING'] = '0'
+    # os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
     os.environ['VLLM_USE_FLASHINFER_SAMPLER']='0'
     
     # for deterministic behaviour

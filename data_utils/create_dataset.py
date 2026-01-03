@@ -28,63 +28,6 @@ def load_sst2():
     test_sentences, test_labels = process_raw_data_sst(test_lines)
     return train_sentences, train_labels, test_sentences, test_labels
 
-def load_commonsense_qa_old(name='commonsense_qa', label_dict={'A': 0, 'B': 1, 'C':2, 'D':3, 'E':4}):
-    path = 'data/thoughtsource_100.json'
-    path_test = path_tests[name]
-    train_sentences, train_labels, test_sentences, test_labels = [], [], [], []
-    with open(path, 'r') as file:
-        file = file.read()
-        json_data = json.loads(file)
-
-        if name in ['open_book_qa', 'worldtree']:
-            data = json_data[name]['test']
-        else:
-            data = json_data[name]['validation']        
-
-        for i, json_data in enumerate(data):
-            question = json_data['question']
-            choice = json_data['choices']
-            answer = json_data['answer']
-            label = choice.index(answer[0])
-            candidate = ''
-            for k in range(len(label_dict)):
-                candidate += '\n' + label_dict[k] + ' ' + choice[k] 
-            train_labels.append(label) #label_dict[label]
-            train_sentences.append(question + ' ' + candidate)
-    with open(path_test, 'r') as file:
-        # file = file.read()
-        # data = json.loads(file)
-        if path_test.endswith('.jsonl'):
-            data = [json.loads(line) for line in file]
-        elif path_test.endswith('.json'):
-            data = json.load(file)
-        for json_data in data:
-            question = json_data['question']
-            answer = json_data['answerKey']
-
-            inv_label_dict = {'A': 0, 'B': 1, 'C':2, 'D':3, 'E':4}
-            if answer not in inv_label_dict.keys():
-                continue
-
-            test_labels.append(inv_label_dict[answer])
-
-            choice = question['choices']
-            stem = question['stem'] 
-            candidate = ''
-
-            if 'worldtree' in path_test:
-                candidate = ''
-                for l in inv_label_dict.keys():
-                    pre_l = '(' + l + ')'
-                    stem = stem.replace(pre_l, '\n'+l)
-            else:
-                for k in range(len(choice)):
-                    l, t = choice[k]['label'], choice[k]['text']
-                    candidate += '\n' + l + ' ' + t
-            test_sentences.append(stem + candidate)
-
-    return train_sentences, train_labels, test_sentences, test_labels 
-
 def load_commonsense_qa(inv_label_dict):
     dataset = datasets.load_dataset("tau/commonsense_qa")
     dataset.pop('test') # has no labels, not useful 
