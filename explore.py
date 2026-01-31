@@ -11,6 +11,7 @@ import msgspec
 import pandas as pd
 import torch
 from calibration.model import CalibrationTransformer
+from calibration_methods import CalibrationMethods
 
 # T, embedding_dim = 8, 64
 # positions = torch.arange(T).unsqueeze(-1)  # [5, 1]: [[0], [1], [2], [3], [4]]
@@ -22,16 +23,16 @@ from calibration.model import CalibrationTransformer
 # models = ['meta-llama/Llama-3.1-8B-Instruct', 'Qwen/Qwen3-8B', 'openai/gpt-oss-20b']
 # datasets = ['sst5', 'snli', 'trec', 'rte', 'agnews', 'goemotions', 'dbpedia_l2', 'toxic_chat', 'newsgroups', 'commonsense_qa', 'qqp', 'banking77', 'metatool', 'wildguard', 'when2call', 'wikitoxic', 'amazon_counterfactual', 'massive_intent', 'dbpedia_l1']
 # models = ['meta-llama/Llama-3.1-8B-Instruct']
-datasets = ['yelp_reviews']
-splits = ('train','test')
+# datasets = ['yelp_reviews']
+# splits = ('train','test')
 
-for dataset in datasets:
-    for split in splits:
-        path = f"data/{dataset}/{split}.json"
-        with open(path, 'r') as file:
-            split_data = msgspec.json.decode(file.read())
-        with open(path, 'w') as file:
-            json.dump(split_data, file)
+# for dataset in datasets:
+#     for split in splits:
+#         path = f"data/{dataset}/{split}.json"
+#         with open(path, 'r') as file:
+#             split_data = msgspec.json.decode(file.read())
+#         with open(path, 'w') as file:
+#             json.dump(split_data, file)
 
 # for llm in models:
 #         for dataset in datasets:
@@ -48,9 +49,10 @@ for dataset in datasets:
 # print(f"{time()-s: .2f}")
 
 # s = time()
-# with open("./calibration/datasets/openai_gpt-oss-20b/agnews/train.json", 'r') as file:
+# with open("/mnt/nas/awikdhar/calibration/icl-calibration/data/yahoo_answers/train.json", 'r') as file:
 #     data = json.load(file)
-#     # print(data[0]['inputs'][10][:30])
+#     print(len(data)); exit()
+    # print(data[0]['inputs'][10][:30])
 # print(f"{time()-s: .2f}")
 
 # s = time()
@@ -62,45 +64,49 @@ for dataset in datasets:
 # with open("./calibration/datasets/openai_gpt-oss-20b/agnews/test.json", 'w') as file:
 #     json.dump(data, file)
 
-exit()
+# exit()
 # print(torch.rand(()).item())
 # print(torch.cuda.get_device_name(0), torch.cuda.get_device_name(1), torch.cuda.get_device_name(2), torch.cuda.get_device_name(3), torch.cuda.device_count()); exit()
 # calibrator = CalibrationTransformer(in_features=173, embedding_dim=64, num_layers=12)
-# print(calibrator); exit()
+# print(calibrator)
+# breakpoint()
 # print(f"{sum(p.numel() for p in calibrator.parameters())/10**6: .2f} M parameters"); exit()
 # model = 'Qwen/Qwen3-8B'
 # model = 'openai/gpt-oss-20b'
-# model = 'meta-llama/Llama-3.1-8B-Instruct'
-model = "gemini-2.5-flash"
-datasets = []#['sst5', 'snli', 'trec', 'rte', 'agnews', 'goemotions', 'dbpedia_l2', 'toxic_chat', 'newsgroups']
+model = 'meta-llama/Llama-3.1-8B-Instruct'
+# model = "gemini-2.5-flash"
+datasets = ['sst5', 'snli', 'trec', 'rte', 'agnews', 'goemotions', 'dbpedia_l2', 'toxic_chat', 'newsgroups', 'yahoo_answers']
 
-split = 'test'
+# split = 'test'
 split = 'train'
 
-if 1 or split == 'test':
-    # datasets += ['commonsense_qa', 'qqp', 'banking77', 'metatool', 'wildguard', 'when2call', 'wikitoxic', 'amazon_counterfactual', 'massive_intent', 'dbpedia_l1']
-    datasets += ['qqp', 'commonsense_qa', 'wildguard', 'when2call', 'wikitoxic', 'amazon_counterfactual']
+# if 1 or split == 'test':
+#     datasets += ['commonsense_qa', 'qqp', 'banking77', 'metatool', 'wildguard', 'when2call', 'wikitoxic', 'amazon_counterfactual', 'massive_intent', 'dbpedia_l1', 'yelp_reviews']
+#     datasets += ['qqp', 'commonsense_qa', 'wildguard', 'when2call', 'wikitoxic', 'amazon_counterfactual']
 # datasets = ['metatool', 'dbpedia_l1' 'amazon_counterfactual', 'massive_intent', 'wildguard', 'commonsense_qa', 'qqp']
 # print(os)
 # icl-calibration/calibration/datasets/meta-llama_Llama-3.1-8B-Instruct/commonsense_qa
-# print(f"|----{model}----|")
-# for idx, dataset in enumerate(datasets):
-#     print(f'\n{idx+1}. '+dataset + ': ')
-#     # for split in ('train', ):
-#     try:
-#         with open(f"calibration/datasets/{model.replace('/','_')}/{dataset}/{split}.json") as file:
-#             data = json.load(file)
-#             # if len(data)>1000:
-#             #     data = data[1000:]
-#             sim_count = len([True for item in data if item['sampling_strategy']=='ENTROPY'])
-#             ratio = sim_count/len(data)
-#             print(f' {split} size: {len(data)}')
-#             if abs(ratio-0.5)>0.1:
-#                 print(f' Imbalanced {split} split: {sim_count/len(data)}')
-#     except Exception as e:
-#         print(type(e).__name__, e)
+print(f"|----{model}----|")
+for idx, dataset in enumerate(datasets[::-1]):
+    print(f'\n{idx+1}. '+dataset + ': ')
+    # for split in ('train', ):
+    try:
+        with open(f"calibration/datasets/{model.replace('/','_')}/{dataset}/{split}.json") as file:
+            data = msgspec.json.decode(file.read())
+            # print(data[-1]['logits'])
+            
+            # exit()
+            # if len(data)>1000:
+            #     data = data[1000:]
+            sim_count = len([True for item in data if item['sampling_strategy']=='ENTROPY'])
+            ratio = sim_count/len(data)
+            print(f' {split} size: {len(data)}')
+            if abs(ratio-0.5)>0.1:
+                print(f' Imbalanced {split} split: {sim_count/len(data)}')
+    except Exception as e:
+        print(type(e).__name__, e)
     # print('-----------')
-        # exit()
+        exit()
 # with open(f"calibration/datasets/{model.replace('/','_')}/{dataset}/{split}.json", 'w') as file:
 #     json.dump(data, file, indent=2)
             
@@ -115,8 +121,11 @@ if 1 or split == 'test':
 #     content = f.read()
 #     print(content[-2000:])
 # with open("./raw_logits/sst2_meta-llamasst2_meta-llama_Llama-3.2-3B_0shot_100_subsample_seed0.pkl", 'rb') as f:
-# with open("./raw_logits_high_bs/sst5_meta-llama_Llama-3.1-8B_0shot_rand_entropy_level_seed4.pkl", 'rb') as f:
+# with open("./saved_results/Qwen_Qwen3-Next-80B-A3B-Instruct/amazon_counterfactual/SIMILARITY/6_shot/1_seed.pkl", 'rb') as f:
 #     data = pickle.load(f)
+#     print(data.keys())
+#     print(data['metrics'][CalibrationMethods.TF].__dict__)
+#     print(data['metrics'][CalibrationMethods.TF].calibration_metrics.__dict__)
 #     print(data['all_labels_prob_mass'])
     # print(data, data.keys(), data['all_label_probs'], data['params'], data['accuracies'][0], data['eces'][0])
 #     print(data['raw_logits'].shape, data['all_label_probs'].shape)

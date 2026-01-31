@@ -1,14 +1,18 @@
 from typing import Dict, List
 import json
+import os 
 
 import datasets
 from transformers import AutoTokenizer
-from utils import ROOT_DIR, get_llm_framework
+from utils.gen_utils import ROOT_DIR, get_llm_framework
 import numpy as np
 
 from labels_trie import LabelsTrie
 from llm_framework import LlmFramework
 from gemini.gemini_model import GeminiTokenizer
+
+HF_HOME = os.environ.get('HF_HOME')
+HF_DATASETS_CACHE = os.environ.get('HF_DATASETS_CACHE', f"{HF_HOME}/datasets")
 
 def load_dataset_with_embeddings(dataset:str, split:str):
     sentences, labels, embeddings = [], [], []
@@ -28,12 +32,12 @@ def load_dataset_with_embeddings(dataset:str, split:str):
 def set_label_tokens(labels: List[str], params: Dict):
     params['label_dict'] = {}
     llm_framework = get_llm_framework(params['model'])
-    
+        
     match llm_framework:
         case LlmFramework.GOOGLE:
             tokenizer = GeminiTokenizer(params['model'])
         case _:
-            tokenizer = AutoTokenizer.from_pretrained(params['model'])
+            tokenizer = AutoTokenizer.from_pretrained(params['model'], cache_dir=HF_HOME)
         
     for label_idx, label in enumerate(labels):
         prefix = " " if llm_framework!=LlmFramework.GOOGLE else ""
@@ -81,7 +85,7 @@ def set_prompt_params(params: Dict):
         set_label_tokens(labels, params)
 
     elif params['dataset'] == 'qqp':
-        labels = ['different', 'duplicate']
+        labels = ['Different', 'Duplicate']
         params['prompt_prefix'] = f"Your task is to classify the pair of questions as one of: {', '.join(labels)}."
         params["q_prefix"] = ""
         params["a_prefix"] = "Answer: "
@@ -114,7 +118,7 @@ def set_prompt_params(params: Dict):
         set_label_tokens(labels, params)
 
     elif params['dataset']=='banking77':
-        dataset = datasets.load_dataset('mteb/banking77')
+        dataset = datasets.load_dataset('mteb/banking77', cache_dir=HF_DATASETS_CACHE)
         labels = sorted(dataset["train"].unique("label_text"))
         # labels = [label.replace("_"," ") for label in labels]
         
@@ -128,8 +132,8 @@ def set_prompt_params(params: Dict):
         set_label_tokens(labels, params)
         
     elif params['dataset']=='wildguard':
-        train_dataset = datasets.load_dataset("allenai/wildguardmix", "wildguardtrain")['train']
-        labels = sorted(train_dataset.unique("subcategory")) # classes
+        train_dataset = datasets.load_dataset("allenai/wildguardmix", "wildguardtrain", cache_dir=HF_DATASETS_CACHE)['train']
+        labels = [label.title() for label in sorted(train_dataset.unique("subcategory"))] # classes
                 
         labels_listed = ""
         for i, label in enumerate(labels):
@@ -159,7 +163,7 @@ def set_prompt_params(params: Dict):
         set_label_tokens(labels, params)
             
     elif params['dataset'] == 'snips':
-        train_dataset = datasets.load_dataset("benayas/snips")['test']
+        train_dataset = datasets.load_dataset("benayas/snips", cache_dir=HF_DATASETS_CACHE)['test']
         labels = sorted(train_dataset.unique("category")) # classes
                 
         labels_listed = ""
@@ -172,7 +176,7 @@ def set_prompt_params(params: Dict):
         set_label_tokens(labels, params)
     
     elif params['dataset'] == 'massive_intent':
-        train_dataset = datasets.load_dataset('mteb/amazon_massive_intent', "en")['train']
+        train_dataset = datasets.load_dataset('mteb/amazon_massive_intent', "en", cache_dir=HF_DATASETS_CACHE)['train']
         labels = sorted(train_dataset.unique("label_text")) # classes
                 
         labels_listed = ""
@@ -193,7 +197,7 @@ def set_prompt_params(params: Dict):
         set_label_tokens(labels, params)
     
     elif params['dataset'] == 'newsgroups':
-        train_dataset = datasets.load_dataset('SetFit/20_newsgroups')['train']
+        train_dataset = datasets.load_dataset('SetFit/20_newsgroups', cache_dir=HF_DATASETS_CACHE)['train']
         labels = sorted(train_dataset.unique("label_text")) # classes
                 
         labels_listed = ""
@@ -209,7 +213,7 @@ def set_prompt_params(params: Dict):
         level = int(params['dataset'][-1])
         assert params['dataset'] in ('dbpedia_l1', 'dbpedia_l2'), "only dbpedia_l1 and dbpedia_l2 datasets names allowed (9/70 classes)"
         
-        dataset = datasets.load_dataset('DeveloperOats/DBPedia_Classes')
+        dataset = datasets.load_dataset('DeveloperOats/DBPedia_Classes', cache_dir=HF_DATASETS_CACHE)
         labels = sorted(dataset['train'].unique(f'l{level}')) # classes
         
         labels_listed = ""
@@ -222,7 +226,7 @@ def set_prompt_params(params: Dict):
         set_label_tokens(labels, params)
 
     elif params['dataset'] == 'wikitoxic':
-        labels = ['benign', 'toxic']
+        labels = ['Benign', 'Toxic']
         
         params['prompt_prefix'] = f"Your task is to classify the given Wikipedia comment as one of the following: {', '.join(labels)}"
         params["q_prefix"] = "Comment: "
@@ -230,7 +234,7 @@ def set_prompt_params(params: Dict):
         set_label_tokens(labels, params)
 
     elif params['dataset'] == 'goemotions':
-        dataset = datasets.load_dataset('mrm8488/goemotions')['train']
+        dataset = datasets.load_dataset('mrm8488/goemotions', cache_dir=HF_DATASETS_CACHE)['train']
         feature_names = list(dataset.features.keys())
         labels = [col for col in feature_names if col not in 
                     [ 'text',
@@ -253,6 +257,35 @@ def set_prompt_params(params: Dict):
         params["a_prefix"] = "Answer: "
         set_label_tokens(labels, params)
            
+    elif params['dataset'] == 'yelp_reviews':
+        labels = ['1 star', '2 stars', '3 stars', '4 stars' , '5 stars']
+        
+        params['prompt_prefix'] = f"Your task is to classify the given review as one of the following ratings: {', '.join(labels)}"
+        params["q_prefix"] = "Review: "
+        params["a_prefix"] = "Rating: "
+        set_label_tokens(labels, params)
+    
+    elif params['dataset'] == 'yahoo_answers':
+        dataset = datasets.load_dataset('community-datasets/yahoo_answers_topics', cache_dir=HF_DATASETS_CACHE)
+        labels = dataset['train'].features['topic'].names
+
+        labels_listed = ""
+        for i, label in enumerate(labels):
+            labels_listed += f"{i+1}. {label}\n"
+            
+        params['prompt_prefix'] = "Your task is to classify the given question as one of the following topics:\n\n" + labels_listed
+        params["q_prefix"] = "Question: "
+        params["a_prefix"] = "Topic: "
+        set_label_tokens(labels, params)
+                
+    elif params['dataset'] == 'medqa':
+        labels = ['A', 'B', 'C', 'D']
+        
+        params['prompt_prefix'] = f"Your task is to answer the given medical question by specifying the correct option({', '.join(labels)})"
+        params["q_prefix"] = "Question: "
+        params["a_prefix"] = "Answer: "
+        set_label_tokens(labels, params)
+    
     elif params['dataset'] == 'strategy_qa':
         params['prompt_prefix'] = ""
         params["q_prefix"] = "Question: "
@@ -273,7 +306,8 @@ def set_prompt_params(params: Dict):
 
     elif params['dataset'] == 'commonsense_qa':
         labels= ['A', 'B', 'C', 'D', 'E']
-        params['prompt_prefix'] = ""
+
+        params['prompt_prefix'] = f"Your task is to answer the given question by specifying the correct option({', '.join(labels)})"
         params["q_prefix"] = "Question: "
         params["a_prefix"] = "Answer: "
         set_label_tokens(labels, params)

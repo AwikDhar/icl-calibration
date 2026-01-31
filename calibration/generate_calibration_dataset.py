@@ -5,7 +5,9 @@ import random
 from data_utils import load_dataset_with_embeddings, set_prompt_params, IclDataset, IclDatasetSplit
 from sampling_strategies import SamplingStrategy
 from calibration.calibrator_input_generators import *
-from utils import *
+from utils.sampling_utils import *
+from utils.run_utils import *
+
 from tqdm import tqdm 
 import numpy as np
 from time import time
@@ -150,13 +152,17 @@ def generate_calibration_datasets(params_list: List[Dict], datasets: Dict, calib
                     )[0]
                 if sampling_strategy==SamplingStrategy.ENTROPY:        
                     selected_sentences, selected_labels, selected_idxs = random_sampling(all_sentences, all_labels, num_shots+1, EntropyLevels.RANDOM) 
+                    
                     selected_embeddings = np.array([all_embeddings[idx] for idx in selected_idxs])
                     data = data_generation_fn(params, selected_sentences, selected_embeddings, selected_labels)
+                
                 elif sampling_strategy==SamplingStrategy.SIMILARITY:
                     selected_sentences, selected_labels, selected_idxs = random_sampling(all_sentences, all_labels, 1, EntropyLevels.RANDOM) 
+                    
+                    shuffle_examples = random.random() < 0.25 # Keep in-context examples sorted by similarity 75% of the time
                     selected_embeddings = np.array([all_embeddings[idx] for idx in selected_idxs]) # only 1 idx here
                     sampled_data = similarity_sampling(all_sentences, all_embeddings, all_labels, 
-                                                       test_embeddings=selected_embeddings, num_shots=num_shots+1, shuffle=True, return_embeddings=True)
+                                                       test_embeddings=selected_embeddings, num_shots=num_shots+1, shuffle=shuffle_examples, return_embeddings=True)
                     # print(sampled_data.sentences, selected_sentences[0])
                     # exit()
                     # print(sampled_data.embeddings.shape, all_embeddings.shape)
@@ -201,14 +207,12 @@ if __name__ == '__main__':
     parser.add_argument('--approx', dest='approx', action='store_const', const=True, default=True,
                         help='whether to set token prob to zero if not in top 100')
     
-    parser.add_argument('--gpu_id', dest='gpu_id', action='store', default=0, required=False, help='Which CUDA gpu to run model on', type=int)
+    parser.add_argument('--gpu_ids', action='store', default=0, required=False, help='Which CUDA gpu to run model on')
     
     args = parser.parse_args()
     args = vars(args)
     # print(args)
     
-
-    # simple processing
     def convert_to_list(items, cvt_func=None):
         if cvt_func:
             return [cvt_func(s.strip()) for s in items.split(",")]
@@ -217,6 +221,7 @@ if __name__ == '__main__':
 
     args['models'] = convert_to_list(args['models'])
     args['datasets'] = convert_to_list(args['datasets'])
+    args['gpu_ids'] = convert_to_list(args['gpu_ids'], int)
     
     args_check(args)
     main(**args)

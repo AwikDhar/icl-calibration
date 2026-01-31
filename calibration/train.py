@@ -12,26 +12,54 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from calibration.model import CalibrationTransformer, PositionEmbeddingType
+from calibration.model import CalibrationTransformer, PositionEmbeddingType, CalibratorOutputType
 from calibration.temperature import get_equivalent_temp
 from calibration.data_utils import load_datasets, get_batch
 
 from losses import BrierLoss
-from utils import convert_to_list
+from utils.gen_utils import convert_to_list
+# from utils.run_utils import fix_seed
 from metrics import CalibrationMetrics
    
+import logging
+
+def setup_logger():
+    logFormatter = logging.Formatter(
+        "{asctime} - {levelname} - {message}", 
+        style="{",
+        datefmt="%Y-%m-%d %H:%M"
+    )
+    logger = logging.getLogger(__name__)
+
+    fileHandler = logging.FileHandler("./cal_data_gen.log")
+    fileHandler.setFormatter(logFormatter)
+    logger.addHandler(fileHandler)
+
+    consoleHandler = logging.StreamHandler()
+    consoleHandler.setFormatter(logFormatter)
+    logger.addHandler(consoleHandler)
+
+    logger.setLevel(logging.INFO)
+
+    return logger
+
 def main(llms: List[str], 
          datasets: List[str],
+         unseen_datasets: List[str],
          shots_start: int,
+         shots_end: int,
          datasets_dropout: float,
          temp_augment: bool,
          label_augment: bool,
+         calibrator_output_type: CalibratorOutputType,
          feature_type: str,
-         sampling_strategy:str,
+         sampling_strategies:List[str],
          iterations: int,
          lr: float,
          eval_iter: int,
          batch_size: int,
+         ablation_method: str,
+         num_seeds: int,
          model_name: str,
          resume_saved_ckpt: bool,
          gpu_id: int,
@@ -55,63 +83,86 @@ def main(llms: List[str],
     
     device = f'cuda:{gpu_id}'
     
-    data = load_datasets(llms, datasets, device, feature_type, temp_augment=temp_augment, label_augment=label_augment, sampling_strategy=sampling_strategy)
-                
-    model_dir = f"./calibration/models/"+ (llms[0].replace('/','_') if len(llms)==1 else 'llm_agnostic')
-    if sampling_strategy:
-        model_dir += f"/{sampling_strategy}"
-    model_path = f'{model_dir}/{model_name}'  
-    metrics_path = f'{model_dir}/metrics.json'
-    os.makedirs(model_dir, exist_ok=True)
-    
-    with open(f"calibration/models/transformer_config.json", 'r') as file:
-        config = json.load(file)
+    data = load_datasets(llms, datasets, device, feature_type, splits=('train',), temp_augment=temp_augment, label_augment=label_augment, sampling_strategies=sampling_strategies, purpose="calibrator training")
+    unseen_data = load_datasets(llms, unseen_datasets, device, feature_type, shots_end=shots_end, splits=('test',), temp_augment=False, label_augment=False, sampling_strategies=sampling_strategies, purpose="calibrator validation")
+          
+    for llm in llms:
+        for dataset in unseen_datasets:
+            data[llm][dataset] = unseen_data[llm][dataset]
         
-    sample_model, sample_dataset = llms[0], datasets[0]
-    T, C = data[sample_model][sample_dataset]['train']['inputs'][0].shape
-    calibrator = CalibrationTransformer(
-        in_features=C, 
-        context_length=config['context_length'], 
-        embedding_dim=config['embedding_dim'], 
-        num_heads=config['num_heads'], 
-        num_layers=config['num_layers'],
-        dropout=config['dropout'],
-        pos_embedding_type=PositionEmbeddingType.Sinusoidal
-    ).to(device)
+    sample_model, sample_dataset, sample_strategy = llms[0], datasets[0], sampling_strategies[0]
+    T, C = data[sample_model][sample_dataset][sample_strategy]['train']['inputs'][0].shape
     
-    print(calibrator)
-    print(f"{sum(p.numel() for p in calibrator.parameters())/10**6: .2f} M parameters")
-    
-    if resume_saved_ckpt:
-        state_dict = torch.load(model_path, weights_only=True)
-        cleaned_state_dict = {}
-        for key, value in state_dict.items():
-            if key.startswith('_orig_mod.'):
-                cleaned_state_dict[key.replace('_orig_mod.', '')] = value
-            else:
-                cleaned_state_dict[key] = value
-                
-        calibrator.load_state_dict(cleaned_state_dict)    
+    # seeds>1 means deterministic training and seed specific checkpoints
+    for seed in range(num_seeds):
+        # if seeds>1:
+        #     fix_seed(seed)
+        
+        model_dir = f"./calibration/models/"+ (llms[0].replace('/','_') if len(llms)==1 else 'llm_agnostic')
+        if len(sampling_strategies)==1:
+            model_dir += f"/{sampling_strategies[0]}"
+        if ablation_method:
+            model_dir += f"/{ablation_method}"
+        if num_seeds>1:
+            model_dir += f"/{seed}_seed"
+            
+        model_path = f'{model_dir}/{model_name}'  
+        metrics_path = f'{model_dir}/metrics.json'
+        os.makedirs(model_dir, exist_ok=True)
+        
+        if os.path.exists(model_path):
+            logging.info(f"Skipping seed {seed}, already done before.")
+            continue
+        
+        with open(f"calibration/models/transformer_config.json", 'r') as file:
+            config = json.load(file)
+            
+        calibrator = CalibrationTransformer(
+            in_features=C, 
+            context_length=config['context_length'], 
+            embedding_dim=config['embedding_dim'], 
+            num_heads=config['num_heads'], 
+            num_layers=config['num_layers'],
+            dropout=config['dropout'],
+            pos_embedding_type=PositionEmbeddingType.SINUSOIDAL,
+            output_type=calibrator_output_type,
+        ).to(device)
+        
+        print(calibrator)
+        print(f"{sum(p.numel() for p in calibrator.parameters())/10**6: .2f} M parameters")
+        
+        if resume_saved_ckpt:
+            state_dict = torch.load(model_path, weights_only=True)
+            cleaned_state_dict = {}
+            for key, value in state_dict.items():
+                if key.startswith('_orig_mod.'):
+                    cleaned_state_dict[key.replace('_orig_mod.', '')] = value
+                else:
+                    cleaned_state_dict[key] = value
                     
-    calibrator = torch.compile(calibrator, fullgraph=True, dynamic=False, mode="max-autotune")
-    
-    # print(model_path); exit()
-    train(
-        calibrator, 
-        data,
-        datasets_dropout,
-        iterations,
-        lr,
-        eval_iter,
-        batch_size,
-        device,
-        model_path,
-        metrics_path,
-        resume_saved_ckpt, 
-        shots_start
-    )
+            calibrator.load_state_dict(cleaned_state_dict)    
+                        
+        calibrator = torch.compile(calibrator, fullgraph=True, dynamic=False, mode="max-autotune")
+        
+        # print(model_path); exit()
+        train(
+            calibrator, 
+            calibrator_output_type,
+            data,
+            datasets_dropout,
+            iterations,
+            lr,
+            eval_iter,
+            batch_size,
+            device,
+            model_path,
+            metrics_path,
+            resume_saved_ckpt, 
+            shots_start
+        )
 
 def train(model: nn.Module, 
+          calibrator_output_type: CalibratorOutputType,
           data: Dict, 
           datasets_dropout: float,
           iterations: int, 
@@ -144,13 +195,12 @@ def train(model: nn.Module,
         with open(metrics_path, 'r') as file:
             metrics = json.load(file)
             best_eval_calibrated_ece = metrics['best_eval_calibrated_ece']
+            best_eval_calibrated_brier = metrics['best_eval_calibrated_brier']
     else:     
         best_eval_calibrated_ece = torch.inf
-    
-    ckpt_eval_brier_score = torch.inf
-    ckpt_eval_ce_loss = torch.inf   
-    best_eval_loss = torch.inf
-    
+        best_eval_calibrated_brier = torch.inf
+  
+    best_eval_loss = torch.inf    
     improved = False
     
     # temp_lambda = 0.5
@@ -164,7 +214,10 @@ def train(model: nn.Module,
     
     for llm in data:
         for dataset in data[llm]:
-            datasets.append((llm, dataset))
+            for sampling_strategy in data[llm][dataset]:
+                if 'train' not in data[llm][dataset][sampling_strategy]:
+                    continue
+                datasets.append((llm, dataset, sampling_strategy))
     
     grad_history = deque(maxlen=40000)
     
@@ -178,60 +231,28 @@ def train(model: nn.Module,
         active_count = round( (1-datasets_dropout)*len(datasets) )
         active_datasets = random.sample(datasets, active_count)
         
-        for (llm, dataset) in active_datasets:
-            inputs, logits, labels = get_batch(data[llm][dataset]['train'], batch_size) # B,T,C
-            correctness_labels = (logits.argmax(dim=-1)==labels).float()
-            B,T,num_classes = logits.shape
-                        
-            pred_probs, pred_classes = logits.max(dim=-1)  # (B, T, num_classes), (B, T)
+        for (llm, dataset, sampling_strategy) in active_datasets:
+            inputs, logits, labels = get_batch(data[llm][dataset][sampling_strategy]['train'], batch_size) # B,T,C
+                                    
+            outputs = model(inputs) # B,T,1
             
-            calibrated_pred_probs = model(inputs) # B,T,1
+            calibrated_logits, loss = get_calibrated_logits_loss(logits, outputs, calibrator_output_type, labels, shots_start)
+
             # Focal loss
             # calibrated_probs_flat = calibrated_pred_probs[:, shots_start:, :].reshape(-1)
             # correctness_flat = correctness_labels[:, shots_start:].reshape(-1)
 
             # pt = correctness_flat * calibrated_probs_flat + (1 - correctness_flat) * (1 - calibrated_probs_flat)
             # loss = ( - ((1-pt)**gamma) * torch.log(pt + 1e-8)).mean() 
-            
-            # Brier loss
-            loss = F.mse_loss(
-                calibrated_pred_probs[:,shots_start:, :].reshape(B*(T-shots_start)), 
-                correctness_labels[:,shots_start:].reshape(B*(T-shots_start))
-                )
-            # loss = F.binary_cross_entropy(
-            #     calibrated_pred_probs[:,shots_start:, :].reshape(B*(T-shots_start)), 
-            #     correctness_labels[:,shots_start:].reshape(B*(T-shots_start)),
-            # )  
-                        
-            # shotwise losses
-            # ce_loss = F.binary_cross_entropy(
-            #     calibrated_pred_probs[:,shots_start:].reshape(B*(T-shots_start)), 
-            #     correctness_labels[:,shots_start:].reshape(B*(T-shots_start)),
-            #     reduction='none'
-            # )  
 
             # Linearly increasing weights that sum to 1
             # num_positions = T - shots_start
-            # shot_weights = torch.linspace(1, num_positions, num_positions, device=device) # increasing weight to higher shots to promote ICL
+            # shot_weights = torch.linspace(0.5, 1, num_positions, device=device) # increasing weight to higher shots to promote ICL
             # shot_weights = shot_weights / shot_weights.sum()  
 
-            # ce_loss = (shotwise_losses * shot_weights.unsqueeze(0))#.mean() # weighted sum of shot losses 
+            # shotwise_losses = loss.reshape(B, (T-shots_start))
+            # loss = (shotwise_losses * shot_weights.unsqueeze(0)).sum(dim=1).mean() # weighted sum of shot losses 
             
-            calibrated_pred_probs = torch.clamp(calibrated_pred_probs, min=1/num_classes + 0.01, max = 0.99)
-            remaining_prob_mass = 1.0 - calibrated_pred_probs # Shape: B, T, 1
-            remaining_prob_per_class = remaining_prob_mass / (num_classes - 1) 
-            
-            # 4. Concatenate: [P'_max | P'_other, P'_other, ...]
-            # Initialize all probabilities to the uniform remaining probability
-            calibrated_probs = remaining_prob_per_class.repeat(1, 1, num_classes) # Shape: B, T, num_classes
-            
-            # Set the predicted class to the calibrated probability
-            calibrated_probs.scatter_(dim=-1, index=pred_classes.unsqueeze(-1), 
-                                    src=calibrated_pred_probs)
-            
-            calibrated_logits = torch.log(calibrated_probs + 1e-5)
-            # # calibrated_logits = logits*temperatures # B,T,num_classes
-
             # pt = torch.exp(-ce_loss)
             # loss = (((1-pt)**gamma) * ce_loss).mean()#.reshape(B, T-shots_start)
             # loss = (shotwise_focal_loss * shot_weights.unsqueeze(0)).mean() # weighted sum of shot losses 
@@ -241,7 +262,8 @@ def train(model: nn.Module,
                             
             if (iter+1)%eval_iter==0:
                 with torch.inference_mode():
-                    cur_metrics = CalibrationMetrics(logits, calibrated_logits, labels, shots_start)
+                    # fast approximation of ECE with binned=True, training dataset ECEs are not that important
+                    cur_metrics = CalibrationMetrics(logits, calibrated_logits, labels, shots_start, binned=True)  
                     if not train_metrics:
                         train_metrics = cur_metrics
                     else:
@@ -264,38 +286,38 @@ def train(model: nn.Module,
         if (iter+1)%eval_iter==0:
             train_metrics /= active_count
             
-            eval_loss, eval_metrics = eval(model, data, shots_start, None, device)
             print('|------EVAL------|')
+            eval_loss, eval_metrics = eval(model, calibrator_output_type, data, shots_start, batch_size=None)
             print(f'Step: {iter+1} | Eval loss: {eval_loss.item() : .4f}\nTrain ECE: {train_metrics.ece : .4f}, Train calibrated ECE: {train_metrics.calibrated_ece : .4f}\n' 
                   +f'Eval ECE: {eval_metrics.ece : .4f}, Eval calibrated ECE: {eval_metrics.calibrated_ece : .4f}\n'
                   +f'Eval brier: {eval_metrics.brier_score : .4f}, Eval calibrated brier: {eval_metrics.calibrated_brier_score : .4f}\n'
             )           
-            if eval_metrics.calibrated_ece<best_eval_calibrated_ece:
+            if eval_metrics.calibrated_ece<best_eval_calibrated_ece and eval_metrics.calibrated_brier_score<best_eval_calibrated_brier:
                 if hasattr(model, '_orig_mod'):
                     torch.save(model._orig_mod.state_dict(), model_path)
                 else:
                     torch.save(model.state_dict(), model_path)
                 
                 improved = True
-                print("Saved improved model\n")
+                print(f"Saved improved model to {model_path}\n")
                 best_eval_calibrated_ece = eval_metrics.calibrated_ece
-                ckpt_eval_brier_score = eval_metrics.calibrated_brier_score
+                best_eval_calibrated_brier = eval_metrics.calibrated_brier_score
                 
             if eval_loss<best_eval_loss:
                 best_eval_loss = eval_loss.item()
 
-    print(f"Best eval calibrated ECE: {best_eval_calibrated_ece}, best CE loss: {best_eval_loss}")
+    print(f"\nBest CE loss: {best_eval_loss} \nBest eval calibrated ECE: {best_eval_calibrated_ece} \nBest eval calibrated brier: {best_eval_calibrated_brier}")
       
     if improved:     
         with open(metrics_path, 'w') as file:
             metrics = {
                 "best_eval_loss": best_eval_loss,
                 "best_eval_calibrated_ece":best_eval_calibrated_ece,
-                "ckpt_eval_brier_score" : ckpt_eval_brier_score
+                "best_eval_calibrated_brier" : best_eval_calibrated_brier
             }
             json.dump(metrics, file)
       
-def eval(model, data, shots_start, batch_size, device):
+def eval(model, calibrator_output_type, data, shots_start, batch_size):
     total_loss = 0
     metrics = None
     batch_size = None # ensure entire dataset eval for reliable checkpoints. change if needed
@@ -306,40 +328,107 @@ def eval(model, data, shots_start, batch_size, device):
     with torch.inference_mode():
         for llm in data:
             for dataset in data[llm]:
-                inputs, logits, labels = get_batch(data[llm][dataset]['test'], batch_size) # B,T,C | B,T,num_classes | B,T
-                correctness_labels = (logits.argmax(dim=-1)==labels).float()
-                num_classes = logits.shape[-1]
-                
-                pred_classes = logits.argmax(dim=-1)  # B, T
-                
-                calibrated_pred_probs = model(inputs) # B,T,1
-                calibrated_pred_probs = torch.clamp(calibrated_pred_probs, min=1/num_classes + 0.01, max = 0.99)
-                
-                temperatures = get_equivalent_temp(logits, calibrated_pred_probs)  # B, T, 1
-                calibrated_logits = logits*temperatures
-
-                B,T,num_classes = calibrated_logits.shape
-                # loss = F.cross_entropy(calibrated_logits[:,shots_start:,:].reshape(B*(T-shots_start), num_classes), 
-                #                         labels[:,shots_start:].reshape(B*(T-shots_start)))
-                loss = F.binary_cross_entropy(
-                    calibrated_pred_probs[:,shots_start:].reshape(B*(T-shots_start)), 
-                    correctness_labels[:,shots_start:].reshape(B*(T-shots_start)))
-                
-                total_loss += loss
-                
-                cur_metrics = CalibrationMetrics(logits, calibrated_logits, labels, shots_start)
-                if not metrics:
-                    metrics = cur_metrics
-                else:
-                    metrics += cur_metrics
+                for sampling_strategy in data[llm][dataset]:
+                    if 'train' in data[llm][dataset][sampling_strategy]:
+                        continue
+                    # print(dataset)
+                    inputs, logits, labels = get_batch(data[llm][dataset][sampling_strategy]['test'], batch_size) # B,T,C | B,T,num_classes | B,T
+                    correctness_labels = (logits.argmax(dim=-1)==labels).float()
+                    num_classes = logits.shape[-1]
+                                    
+                    outputs = model(inputs) # B,T,1
+                    calibrated_logits, loss = get_calibrated_logits_loss(logits, outputs, calibrator_output_type, labels, shots_start)
                     
-                num_datasets += 1
+                    total_loss += loss
+                    
+                    B,T,num_classes = calibrated_logits.shape
+                    
+                    # Compute metrics per shot and average them
+                    cur_metrics = None
+                    for shot in range(shots_start, T):
+                        shot_metrics = CalibrationMetrics(
+                            logits[:, [shot], :], calibrated_logits[:, [shot], :], labels[:, [shot]], 
+                            shots_start=0, binned=False
+                        )
+                        if cur_metrics is None:
+                            cur_metrics = shot_metrics
+                        else:
+                            cur_metrics += shot_metrics
+                    
+                    # Average over shots
+                    num_shots = T - shots_start
+                    cur_metrics /= num_shots
+                    
+                    if not metrics:
+                        metrics = cur_metrics
+                    else:
+                        metrics += cur_metrics
+                        
+                    num_datasets += 1
         
         total_loss /= num_datasets
         metrics /= num_datasets
         
         return total_loss, metrics
+   
+def get_calibrated_logits_loss(logits, outputs, calibrator_output_type, labels, shots_start):
+    if calibrator_output_type is CalibratorOutputType.CALIBRATED_PROBABILITY:
+        return get_correctness_calibrated_logits_loss(logits, outputs, labels, shots_start)
+
+    if calibrator_output_type is CalibratorOutputType.TEMPERATURE:
+        return get_temperature_calibrated_logits_loss(logits, outputs, labels, shots_start)
+
+def get_correctness_calibrated_logits_loss(logits, calibrated_pred_probs, labels, shots_start):
+    correctness_labels = (logits.argmax(dim=-1)==labels).float()        
+    pred_probs, pred_classes = logits.max(dim=-1)  # (B, T, num_classes), (B, T)
     
+    B,T,num_classes = logits.shape
+    
+    # Brier loss
+    # loss = F.mse_loss(
+    #     calibrated_pred_probs[:,shots_start:, :].reshape(B*(T-shots_start)), 
+    #     correctness_labels[:,shots_start:].reshape(B*(T-shots_start)),
+    #     # reduction='none'
+    #     )
+    loss = F.binary_cross_entropy(
+        calibrated_pred_probs[:,shots_start:, :].reshape(B*(T-shots_start)), 
+        correctness_labels[:,shots_start:].reshape(B*(T-shots_start)),
+        # reduction='none'
+    )
+    
+    # calibrated_pred_probs = torch.clamp(calibrated_pred_probs, min=1/num_classes + 0.01, max = 0.99)
+    # remaining_prob_mass = 1.0 - calibrated_pred_probs # Shape: B, T, 1
+    # remaining_prob_per_class = remaining_prob_mass / (num_classes - 1) 
+    
+    # # 4. Concatenate: [P'_max | P'_other, P'_other, ...]
+    # # Initialize all probabilities to the uniform remaining probability
+    # calibrated_probs = remaining_prob_per_class.repeat(1, 1, num_classes) # Shape: B, T, num_classes
+    
+    # # Set the predicted class to the calibrated probability
+    # calibrated_probs.scatter_(dim=-1, index=pred_classes.unsqueeze(-1), 
+    #                         src=calibrated_pred_probs)
+    
+    # calibrated_logits = torch.log(calibrated_probs + 1e-5)
+    temperatures = get_equivalent_temp(logits, calibrated_pred_probs, num_iters=10)  # B, T, 1
+    # temperatures = torch.nan_to_num(temperatures, nan=1.0)
+    
+    calibrated_logits = logits*temperatures
+        
+    return calibrated_logits, loss
+
+def get_temperature_calibrated_logits_loss(logits, temperatures, labels, shots_start):
+    B,T,num_classes = logits.shape
+
+    calibrated_logits = logits*temperatures
+
+    loss = F.cross_entropy(
+        calibrated_logits[:,shots_start:, :].reshape(B*(T-shots_start), num_classes), 
+        labels[:,shots_start:].reshape(B*(T-shots_start)),
+        # reduction='none'
+    )
+    
+    return calibrated_logits, loss
+        
 def _get_grad_norm(model: nn.Module):
     total_norm = 0
     for p in model.parameters():
@@ -349,7 +438,7 @@ def _get_grad_norm(model: nn.Module):
     total_norm = total_norm ** (1. / 2)
     return total_norm 
 
-def get_optimizer(model, learning_rate=1e-3, weight_decay_attn=0.01, weight_decay_mlp=0.05):
+def get_optimizer(model, learning_rate=1e-3, weight_decay_attn=0.00, weight_decay_mlp=0.05):
     """
     Get an optimizer with model layer/module specific weight decay
     """
@@ -373,7 +462,7 @@ def get_optimizer(model, learning_rate=1e-3, weight_decay_attn=0.01, weight_deca
     param_groups = [
         {'params': attn_params, 'weight_decay': weight_decay_attn},
         {'params': mlp_params, 'weight_decay': weight_decay_mlp},
-        {'params': other_params, 'weight_decay': 0.00},
+        {'params': other_params, 'weight_decay': 0.02},
     ]
     
     # Filter out empty groups
@@ -393,20 +482,24 @@ def set_torch_env():
     torch.set_float32_matmul_precision('high') # better performance as per warning during torch.compile
     
 if __name__ == '__main__':
+    logger = setup_logger()
     set_torch_env()
     
     parser = argparse.ArgumentParser()
     # core arguments
     parser.add_argument('--llms', dest='llms', action='store', required=True, help='name of llm(s) to train the calibrator for')
     parser.add_argument('--datasets', dest='datasets', action='store', required=True, help='name of dataset to train the calibrator for')
+    parser.add_argument('--unseen_datasets', action='store', required=False, help='name of dataset to eval the calibrator on')
+    parser.add_argument('--shots_end', dest='shots_end', action='store', required=False, type=int, default=None, help='Till which shot # we will do calibration eval')
     parser.add_argument('--datasets_dropout', dest='datasets_dropout', action='store', required=False, default=0.8, help='fraction of datasets randomly dropped out each training iteration')
     parser.add_argument('--feature_type', dest='feature_type', action='store', required=False, default="", help='the type of input features that make up the dataset')
-    parser.add_argument('--sampling_strategy', dest='sampling_strategy', action='store', required=False, default=None, help='what sampling strategy data to select(entropy vs similarity) (default: None - means select all)')
-    parser.add_argument('--shots_start', dest='shots_start', action='store', required=False, type=int, default=2, help='which shot # onwards we will do calibration for training and eval')
+    parser.add_argument('--sampling_strategies', action='store', required=False, default=None, help='what sampling strategy data to select(entropy vs similarity) (default: None - means select all)')
+    parser.add_argument('--shots_start', dest='shots_start', action='store', required=True, type=int, default=None, help='which shot # onwards we will do calibration for training and eval')
     parser.add_argument('--temp_augment', dest='temp_augment', action='store_const', const=True, default=False,
                         help="Whether or not to randomly temperature scale data logits(and affect features) for robust training")
     parser.add_argument('--label_augment', dest='label_augment', action='store_const', const=True, default=False,
                         help="Whether or not to randomly sample synthetic labels from a temp scaled prob distribution for accuracy variation/robust training")
+    
     
     # general training args
     parser.add_argument('--iterations', dest='iterations', action='store', required=False, type=int, default=20000 , help='number of iterations for training')
@@ -414,6 +507,11 @@ if __name__ == '__main__':
     parser.add_argument('--eval_iter', dest='eval_iter', action='store', required=False, type=int, default=400, help='number of iterations after which to do eval since start/last eval')
     parser.add_argument('--batch_size', dest='batch_size', action='store', required=False, type=int, default=32,
                         help='batch size for model training')
+    
+    parser.add_argument('--calibrator_output_type', action='store', required=False, default="calibrated_probability", help='What the transformer calibrator outputs(temperature/calibrated probability)')
+    parser.add_argument('--ablation_method', action='store', required=False, default=None, help='Ablation method name, if performing ablation')
+    parser.add_argument('--num_seeds', action='store', required=False, default=1, type=int, help='Number of seeds to train calibrators for')
+    
     # other args
     parser.add_argument('--model_name', dest='model_name', action='store', required=False, default="calibrator", help='custom name for the model(calibrator), used for saving the checkpoints')    
     parser.add_argument('--resume_saved_ckpt', dest='resume_saved_ckpt', action='store_const', const=True, default=False, help='whether to resume training from saved model')
@@ -421,9 +519,21 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     args = vars(args)
-            
-    args['datasets'] = convert_to_list(args['datasets'])
+    print(args)
+         
     args['llms'] = convert_to_list(args['llms'])
-
+    args['datasets'] = convert_to_list(args['datasets'])
+    if args.get('unseen_datasets'):
+        args['unseen_datasets'] = convert_to_list(args['unseen_datasets'])
+    else:
+        logger.warning
+        args['unseen_datasets'] = args['datasets']
+        
+    args['calibrator_output_type'] = CalibratorOutputType[args['calibrator_output_type'].upper()]
+    if args.get('sampling_strategies'): 
+        args['sampling_strategies'] = convert_to_list(args['sampling_strategies'], lambda s: s.upper())
+    else:
+        args['sampling_strategies'] = ['ENTROPY', 'SIMILARITY']
+        
     args_check(args)
     main(**args)

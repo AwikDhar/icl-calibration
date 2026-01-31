@@ -1,11 +1,9 @@
-accelerate==1.10.0
-datasets==4.0.0
-EETQ @ file:///mnt/nas/awikdhar/calibration/tmp/EETQ
 ninja==1.13.0
-numpy==2.2.6
-pandas==2.3.1
-relplot==1.0.1
 tqdm==4.67.1
-transformers==4.55.2
-vllm==0.10.1.1
-orjson==3.11.4
+msgspec==0.19.0
+vllm==0.13.0
+datasets==4.4.2
+sentence-transformers==5.2.0
+google-auth==2.43.0
+google-genai==1.55.0
+relplot==1.0.1

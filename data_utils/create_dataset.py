@@ -6,7 +6,7 @@ import random
 import json
 import numpy as np
 from sklearn.model_selection import train_test_split
-from utils import ROOT_DIR
+from utils.gen_utils import ROOT_DIR
 
 path_tests = {'strategy_qa' : 'data/strategy_qa/strategyqa_train.json', 'commonsense_qa': 'data/commonsense_qa/dev_rand_split.json', 'open_book_qa': 'data/open_book_qa/test.jsonl', 'worldtree': 'data/worldtree/test.json'}
 
@@ -516,6 +516,7 @@ def load_goemotions():
     
     # Shuffle and select
     dataset = dataset.shuffle(seed=42).select(range(min(10**5, len(dataset))))
+    # print(min(10**5, len(dataset))); exit()
     dataset = dataset.train_test_split(train_size=0.8, seed=42)
     
     def format_example(examples):
@@ -539,13 +540,93 @@ def load_goemotions():
 
 def load_yelp_reviews():
     dataset = datasets.load_dataset('Yelp/yelp_review_full').shuffle(seed=42)
-    dataset = dataset.filter(lambda example: len(example['text'])<1000) 
+    dataset = dataset.filter(lambda example: len(example['text'])<1000, load_from_cache_file=False) 
     dataset['train'] = dataset['train'].select(range(10**5))
 
     train_sentences = list(dataset['train']['text'])
     train_labels = list(dataset['train']['label'])
     test_sentences = list(dataset['test']['text'])
     test_labels = list(dataset['test']['label'])
+    
+    return train_sentences, train_labels, test_sentences, test_labels
+
+def load_yahoo_answers():
+    dataset = datasets.load_dataset('community-datasets/yahoo_answers_topics').shuffle(seed=42)
+    print(len(dataset['train']), len(dataset['test']))
+    # print(dataset['train']['topic'][0], dataset['train'].features['topic'].names, dataset['train'].features['topic'].int2str(0)); exit()
+    def length_filter(example):
+        title = example.get('question_title') or ""
+        content = example.get('question_content') or ""
+        
+        total_length = len(title) + len(content)
+        
+        return 100< total_length < 1000
+
+    dataset = dataset.filter(length_filter, load_from_cache_file=False)    
+    dataset['train'] = dataset['train'].select(range(min(10**5, len(dataset['train']))))
+
+    def format_text(example):
+        example['text'] = example['question_title'] + " " + example['question_content']
+        return example
+    
+    dataset = dataset.map(format_text)
+    
+    train_sentences = list(dataset['train']['text'])
+    train_labels = list(dataset['train']['topic'])
+    test_sentences = list(dataset['test']['text'])
+    test_labels = list(dataset['test']['topic'])
+    
+    return train_sentences, train_labels, test_sentences, test_labels
+
+def load_medqa():
+    dataset = datasets.load_dataset('GBaker/MedQA-USMLE-4-options').shuffle(seed=42)
+
+    train_size = len(dataset['train'])
+    dataset['test'] = concatenate_datasets([
+        dataset['test'], 
+        dataset['train'].select(range(train_size - 1000, train_size))
+    ])
+    dataset['train'] = dataset['train'].select(range(train_size - 1000))
+    
+    def format_example(example):
+        # Combine question with options
+        question_text = example['question'] + "\n"
+        for key in ['A', 'B', 'C', 'D']:
+            question_text += f"{key}. {example['options'][key]}\n"
+        example['text'] = question_text
+        
+        label_map = {'A': 0, 'B': 1, 'C': 2, 'D': 3}
+        example['label'] = label_map[example['answer_idx']]
+        return example
+    
+    dataset = dataset.map(format_example)
+    
+    train_sentences = list(dataset['train']['text'])
+    train_labels = list(dataset['train']['label'])
+    test_sentences = list(dataset['test']['text'])
+    test_labels = list(dataset['test']['label'])
+    
+    return train_sentences, train_labels, test_sentences, test_labels
+
+def load_medmcqa():
+    dataset = datasets.load_dataset('openlifescienceai/medmcqa').shuffle(seed=42)
+    dataset['train'] = dataset['train'].select(range(min(10**5, len(dataset['train']))))
+    
+    def format_example(example):
+        # Combine question with options
+        question_text = example['question'] + "\n"
+        for key in ['A', 'B', 'C', 'D']:
+            question_text += f"{key}. {example[f'op{key.lower()}']}\n"
+        example['text'] = question_text
+        
+        return example
+    
+    dataset = dataset.map(format_example)
+    
+    train_sentences = list(dataset['train']['text'])
+    train_labels = list(dataset['train']['cop'])
+    test_sentences = list(dataset['test']['text'])
+    test_labels = list(dataset['test']['cop'])
     
     return train_sentences, train_labels, test_sentences, test_labels
 
@@ -629,6 +710,12 @@ def load_dataset(params):
     elif params['dataset'] == 'yelp_reviews':
         orig_train_sentences, orig_train_labels, orig_test_sentences, orig_test_labels = load_yelp_reviews()
         
+    elif params['dataset'] == 'yahoo_answers':
+        orig_train_sentences, orig_train_labels, orig_test_sentences, orig_test_labels = load_yahoo_answers()
+    
+    elif params['dataset'] == 'medqa':
+        orig_train_sentences, orig_train_labels, orig_test_sentences, orig_test_labels = load_medqa()
+    
     elif params['dataset'] == 'strategy_qa':
         params['prompt_prefix'] = ""
         params["q_prefix"] = "Question: "

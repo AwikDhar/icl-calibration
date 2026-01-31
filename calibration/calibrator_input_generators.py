@@ -1,7 +1,10 @@
 from collections import namedtuple
 from typing import Dict, List
 import numpy as np
-from utils import get_similarities, get_results, get_embeddings, js_divergence
+
+from utils.sampling_utils import get_similarities 
+from utils.gen_utils import js_divergence
+from utils.run_utils import get_results, get_embeddings
 
 def generate_data_non_causal(params: Dict, sentences: List[str], embeddings: np.ndarray, labels: List[int]):
     data = {
@@ -210,6 +213,16 @@ def get_autoregressive_results(params: Dict, sentences: List[str], labels: List[
     probs, logits = get_results(params, train_sentences, train_labels, test_sentences)
     
     return probs, logits
+
+# def get_autoregressive_results(params: Dict, sentences: List[str], labels: List[int]):
+#     # LLM's logits(y|x, C) to be calibrated by transformer's output T
+#     train_sentences = [sentences[:sent_idx] for sent_idx in range(len(sentences))]
+#     train_labels = [labels[:sent_idx] for sent_idx in range(len(sentences))]
+#     test_sentences = [sentences[sent_idx] for sent_idx in range(len(sentences))]
+    
+#     probs, logits = get_results(params, train_sentences[::-1], train_labels[::-1], test_sentences[::-1])
+    
+#     return probs[::-1], logits[::-1]
 
 def get_shifted_features(probs, preds, labels):
     shifted_gt_probs = np.concatenate((

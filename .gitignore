@@ -5,6 +5,7 @@
 *.pkl
 *.pt
 # *.png
+**/calibrator_*
 
 setup.sh
 vllm_test.py

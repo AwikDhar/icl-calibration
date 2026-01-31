@@ -1,17 +1,20 @@
 import argparse
 import os
 from transformers import AutoTokenizer
-from utils import convert_to_list
+from utils.gen_utils import convert_to_list
 from data_utils.load_data import set_prompt_params
 
 def main(models, datasets):
     for model in models:
         for dataset in datasets:
-            params={'dataset':dataset}
+            params={'dataset':dataset, 'model':model}
             set_prompt_params(params)
-            print(params['label_dict'])
+            print(params['label_dict']); exit()
             
-            tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True, cache_dir=os.environ['HF_HOME'])
+            HF_HOME = os.environ['HF_HOME']
+            HF_DATASETS_CACHE = os.environ.get('HF_DATASETS_CACHE', f"{HF_HOME}/datasets")
+            
+            tokenizer = AutoTokenizer.from_pretrained(model, trust_remote_code=True, cache_dir=HF_DATASETS_CACHE)
             
             for id, label in params['label_dict'].items():       
                 tokens = tokenizer.tokenize(label)

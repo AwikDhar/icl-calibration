@@ -35,7 +35,7 @@ def tune_temp(logits, labels, lower=0.01, upper=5.0, eps=0.00001):
     t = min([lower, 0.5 * (lower + upper), upper], key=lambda x: float(F.cross_entropy(logits * x, labels)))
     return t
         
-def get_equivalent_temp(logits, calibrated_pred_probs, num_iters=200):
+def get_equivalent_temp(logits, calibrated_pred_probs, num_iters=500):
     """Binary search for T such that the temperature scaled prediction prob is the same as the calibrated prob given by calibrator"""
     B, T_seq, C = logits.shape
     target_log_prob = torch.log(calibrated_pred_probs)  # B, T_seq, 1
@@ -190,7 +190,10 @@ def tune_temp_for_sequence(logits_seq: torch.TensorType, labels_seq: torch.Tenso
         
         loss.backward()
         optimizer.step()
-        
+                # Clamp T to reasonable range
+        with torch.no_grad():
+            temperatures.clamp_(0.01, 100.0)
+            
         if temperatures.grad is not None and torch.norm(temperatures.grad) < 0.001:
             break
     

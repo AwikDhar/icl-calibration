@@ -4,8 +4,12 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 class PositionEmbeddingType(Enum):
-    Sinusoidal=1
-    Absolute=2
+    SINUSOIDAL=0
+    ABSOLUTE=1
+    
+class CalibratorOutputType(Enum):
+    TEMPERATURE=0
+    CALIBRATED_PROBABILITY=1
     
 class CalibrationTransformer(nn.Module):
     def __init__(
@@ -16,13 +20,14 @@ class CalibrationTransformer(nn.Module):
             num_heads=8,
             num_layers=4,
             dropout=0.2,
-            pos_embedding_type=PositionEmbeddingType.Absolute
+            pos_embedding_type=PositionEmbeddingType.SINUSOIDAL,
+            output_type = CalibratorOutputType.CALIBRATED_PROBABILITY
         ):
         super().__init__()
 
-        if pos_embedding_type==PositionEmbeddingType.Absolute:
+        if pos_embedding_type==PositionEmbeddingType.ABSOLUTE:
             self.pos_embedding = nn.Embedding(num_embeddings=context_length, embedding_dim=embedding_dim)
-        elif pos_embedding_type==PositionEmbeddingType.Sinusoidal:
+        elif pos_embedding_type==PositionEmbeddingType.SINUSOIDAL:
             pe = self.sinusoidal_pe(seq_len=context_length, embedding_dim=embedding_dim) # (CL, embedding_dim)
             self.register_buffer("pos_embedding", pe)
         self.pos_embedding_type = pos_embedding_type
@@ -42,21 +47,28 @@ class CalibrationTransformer(nn.Module):
         self.transformer_encoder = nn.TransformerEncoder(encoder_layer, num_layers=num_layers)
         
         self.lm_head = nn.Linear(embedding_dim, 1, bias=False)
+        self.output_type = output_type
         
     def forward(self, inputs: torch.TensorType):
         B,T,C = inputs.shape
         
-        if self.pos_embedding_type==PositionEmbeddingType.Absolute:
+        if self.pos_embedding_type==PositionEmbeddingType.ABSOLUTE:
             positions = torch.arange(T, device=inputs.device)
             pos_embedding = self.pos_embedding(positions)
-        elif self.pos_embedding_type==PositionEmbeddingType.Sinusoidal:
+        elif self.pos_embedding_type==PositionEmbeddingType.SINUSOIDAL:
             pos_embedding = self.pos_embedding[:T, :]
         
         inputs = self.embedding(inputs) + pos_embedding
         out = self.transformer_encoder(inputs, mask=self.causal_mask[:T, :T], is_causal=True)
         out = self.lm_head(out)
-        out = F.sigmoid(out)
-            
+        
+        if self.output_type==CalibratorOutputType.CALIBRATED_PROBABILITY:
+            out = F.sigmoid(out)
+        elif self.output_type==CalibratorOutputType.TEMPERATURE:
+            out = 0.2 + 1.8*F.sigmoid(out)
+        else:
+            raise NotImplementedError(f"CalibratorOutputType `{self.output_type}` not available, please pick one from {CalibratorOutputType._member_names_}")
+        
         return out
         
     def sinusoidal_pe(self, seq_len: int = None, positions: torch.TensorType = None, embedding_dim: int = None):

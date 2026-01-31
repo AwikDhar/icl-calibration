@@ -57,7 +57,7 @@ class LabelsTrie:
             node.children[token].logit = logit
         # if node==self.root and np.sum(np.exp([child.logit for child in node.children.values()]))==0:
         #     print(token_logits); exit()
-        
+            # print(token_logits); exit()
     def get_label_prob(self, tokens: List[str]) -> float:
         node = self.root
         probs = []

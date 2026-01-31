@@ -1,0 +1,11 @@
+accelerate==1.10.0
+datasets==4.0.0
+# EETQ install this with the git repo
+ninja==1.13.0
+numpy==2.2.6
+pandas==2.3.1
+relplot==1.0.1
+tqdm==4.67.1
+transformers==4.55.2
+vllm==0.10.1.1
+orjson==3.11.4

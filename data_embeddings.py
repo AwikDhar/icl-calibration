@@ -8,7 +8,7 @@ from sentence_transformers import SentenceTransformer
 import numpy as np
 import torch
 from data_utils.create_dataset import load_dataset
-from utils import ROOT_DIR
+from utils.gen_utils import ROOT_DIR
 
 def check_overwriting_creating_dataset(dataset:str):
     if os.path.isfile(f"{ROOT_DIR}/data/{dataset}/train.json"):
@@ -39,7 +39,7 @@ def create_dataset_with_embeddings(model:str, dataset:str, dim = None)->None:
     train_sentences, train_labels, test_sentences, test_labels = load_dataset(params) # entire dataset
     
     batch_size = 256
-    model = SentenceTransformer(f'{model}', device='cuda:0', truncate_dim=dim, cache_folder=os.environ['HF_HOME'], model_kwargs={'torch_dtype':torch.bfloat16})
+    model = SentenceTransformer(f'{model}', device='cuda:0', truncate_dim=dim, cache_folder=os.environ['HF_HOME'], model_kwargs={'dtype':torch.bfloat16})
     with torch.inference_mode():
         train_sentences_embeddings = model.encode(train_sentences, batch_size=batch_size, show_progress_bar=True, convert_to_numpy=True) 
         test_sentences_embeddings =  model.encode(test_sentences, batch_size=batch_size, show_progress_bar=True, convert_to_numpy=True)
