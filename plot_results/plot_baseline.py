@@ -7,7 +7,15 @@ from calibration_methods import CalibrationMethods
 from sampling_strategies import SamplingStrategy
 from utils.gen_utils import convert_to_list
 
-plt.rcParams.update({'font.size': 16})
+plt.rcParams.update({
+    'font.size': 25,        
+    'lines.linewidth': 2.5,
+    'grid.linewidth': 1.5,
+    'xtick.labelsize': 20,    
+    'ytick.labelsize': 20,    
+    'legend.fontsize': 20,    
+    'axes.labelsize': 25      
+})
 
 def get_metric_display_name(metric):
     """Convert metric key to display name."""
@@ -26,7 +34,7 @@ def main(models, datasets, num_seeds, all_shots, sampling_strategies, metric='ec
         for sampling_strategy in sampling_strategies:
             fig, (ax1, ax2) = plt.subplots(1, 2, figsize=(20, 8))
             figtitle = f"{model_display_name} performance across datasets ({sampling_strategy.name.title()} sampled examples)"
-            fig.suptitle(figtitle, fontweight='bold')
+            # fig.suptitle(figtitle, fontweight='bold')
 
             accuracy_means = [[] for _ in range(len(datasets))]
             accuracy_stds  = [[] for _ in range(len(datasets))]
@@ -73,7 +81,7 @@ def main(models, datasets, num_seeds, all_shots, sampling_strategies, metric='ec
                       labelspacing=0, frameon=True)
             
             plt.tight_layout()
-            plt.subplots_adjust(bottom=0.15)  
+            plt.subplots_adjust(bottom=0.25)  
             
             save_dir = Path(f"./plot_results/baseline/{model_save_name}/{sampling_strategy.name}")
             save_dir.mkdir(parents=True, exist_ok=True)

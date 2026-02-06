@@ -10,17 +10,6 @@ from sampling_strategies import EntropyLevels
 import logging
 logger = logging.getLogger(__name__)
 
-ROOT_DIR = Path(__file__).resolve().parent
-SAVE_DIR = ROOT_DIR/"saved_results"
-
-if not os.path.isdir(SAVE_DIR):
-    os.mkdir(SAVE_DIR)
-    print(f"Created {SAVE_DIR} for saving results")
-
-logging.getLogger('urllib3').setLevel(logging.ERROR)
-logging.getLogger('httpx').setLevel(logging.ERROR)
-logging.getLogger('httpcore').setLevel(logging.ERROR)
-
 def get_test_data(sentences, labels, embeddings, count=None):
         ### sample test set
     if count is None:

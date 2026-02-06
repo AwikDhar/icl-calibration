@@ -33,34 +33,23 @@ logging.getLogger('httpx').setLevel(logging.ERROR)
 logging.getLogger('httpcore').setLevel(logging.ERROR)
 
 llm_framework = LlmFramework.VLLM
+embedding_framework = LlmFramework.HF
 infer_model = None
 compile = False
 infer_tokenizer = None
 calibrator = None
 gpu_ids = None
-embedding_model = None
+embedding_models = {}
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
     for i in range(0, len(lst), n):
         yield lst[i:i + n]
 
-def chunk_size_helper(params: Dict):
-    bs = params['bs']
-    if bs is None:
-        if '/' in params['model']:  # hf model
-            return 16 if (params['dataset'] in ('rte', 'cb')) and params['num_shots']>8 else 32
-        elif params['model'] in ['ada', 'babbage', 'curie', 'davinci', 'ada-beta', 'babbage-beta', 'curie-beta', 'davinci-beta']:
-            return 20
-        else:
-            return 8
-    else:
-        return bs
-
 def get_model_snapshot_path(model_name, cache_dir=None):
     global llm_framework
     
-    if llm_framework is LlmFramework.GOOGLE:
+    if 'embedding' not in model_name.lower() and llm_framework is LlmFramework.GOOGLE:
         return model_name
     
     if cache_dir is None:
@@ -86,53 +75,83 @@ def get_model_snapshot_path(model_name, cache_dir=None):
     
     return str(latest_snapshot)
           
-def setup_embedding_model(params: Dict):
-    global embedding_model
-    global gpu_ids
+def calculate_utilization(model_name: str, num_gpus: int, buffer_factor: float = 2) -> float:
+    total_vram_bytes = torch.cuda.get_device_properties(0).total_memory
+    total_vram_gb = total_vram_bytes / (1024**3)
     
-    # if embedding_model is None:
-    #     model_name = params.get('embedding_model', 'google/embeddinggemma-300m')
-    #     truncate_dim = params.get('embedding_dim', 128)
-    #     embedding_model = SentenceTransformer(f"{model_name}", device=f'cuda:{gpu_ids[0]}', truncate_dim=truncate_dim, cache_folder=os.environ['HF_HOME'], model_kwargs={'dtype':torch.float16})
-    if embedding_model is None:
-        os.environ['CUDA_VISIBLE_DEVICES'] = ",".join([str(gpu_id) for gpu_id in gpu_ids])
-        model_name = params.get('embedding_model', 'google/embeddinggemma-300m')
-        # model_name = params.get('embedding_model', 'Qwen/Qwen3-Embedding-4B')
-        HF_HOME = os.environ.get('HF_HOME')
-        cache_dir = os.environ.get('HF_HUB_CACHE', HF_HOME)
+    if "4B" in model_name:
+        est_model_size_gb = 8
+    elif "300m" in model_name.lower():
+        est_model_size_gb = 0.6
+    else:
+        est_model_size_gb = 4 
 
-        model_snapshot_or_card = get_model_snapshot_path(model_name, cache_dir)
-        embedding_model = LLM(
-            model=model_snapshot_or_card,
-            runner="pooling",
-            # attention_config=config.AttentionConfig(backend="TRITON_ATTN"),
-            # dtype='float16',
-            tensor_parallel_size=len(gpu_ids),
-            download_dir=cache_dir,
-            seed=42,
-            gpu_memory_utilization=0.2,
-            hf_overrides={"is_matryoshka": True},
-            trust_remote_code=True,
-            # enforce_eager=True
-        )
+    needed_per_gpu = (est_model_size_gb * buffer_factor) / num_gpus
+    
+    utilization = needed_per_gpu / total_vram_gb
+    return min(utilization, 0.9)
+
+def setup_embedding_model(embedding_model_name: str):
+    global embedding_models
+    global gpu_ids
+    global embedding_framework
+    
+    if embedding_model_name not in embedding_models:
+        if embedding_framework is LlmFramework.HF:
+            # model_name = params.get('embedding_model', 'google/embeddinggemma-300m')
+            # truncate_dim = params.get('embedding_dim', 128)
+            embedding_models[embedding_model_name] = SentenceTransformer(f"{embedding_model_name}", device=f'cuda:0', truncate_dim=128, cache_folder=os.environ['HF_HOME'], model_kwargs={'dtype':torch.bfloat16})
+        elif embedding_framework is LlmFramework.VLLM:
+            HF_HOME = os.environ.get('HF_HOME')     
+            cache_dir = os.environ.get('HF_HUB_CACHE', HF_HOME)
+            
+            # max_model_len = 20000 if 'qwen' in embedding_model_name.lower() else None
+            
+            model_snapshot_or_card = get_model_snapshot_path(embedding_model_name, cache_dir)
+            embedding_models[embedding_model_name] = LLM(
+                model=model_snapshot_or_card,
+                runner="pooling",
+                max_model_len=None,
+                # attention_config=config.AttentionConfig(backend=backend),
+                tensor_parallel_size=1,
+                download_dir=cache_dir,
+                seed=42,
+                gpu_memory_utilization=calculate_utilization(embedding_model_name, 1),
+                hf_overrides={"is_matryoshka": True},
+                trust_remote_code=True,
+            )
+                         
+def get_embedding_prompt(model_name: str, input_text: str, task_desc: str = "classification: "):
+    if "qwen" in model_name.lower():
+        # Qwen3 format: Instruct: {task}\nQuery:{query}
+        full_prompt = f"Instruct: {task_desc}\nQuery: {input_text}"
+    else:
+        # Gemma format: task: {task} | query: {query}
+        full_prompt = f"task: {task_desc} | query: {input_text}"
         
-        del os.environ['CUDA_VISIBLE_DEVICES']
-        
+    return full_prompt
+
 # Get embeddings of sentences at a specified truncated dim. 
 # Full embeddings for similarity sampling, truncated embeddings for calibrator features for easier learning 
-def get_embeddings(params: Dict, sentences: List[str]):
-    global embedding_model
+def get_embeddings(params: Dict, sentences: List[str], embedding_model_name: str):
+    global embedding_models
+    global embedding_framework
     
-    setup_embedding_model(params)
-    # with torch.inference_mode():
-    #     sentences_embeddings = embedding_model.encode(sentences, prompt_name="Classification", show_progress_bar=False, convert_to_numpy=True) 
-    
-    truncate_dim = params.get('embedding_dim', 128)
-    pooling_params = PoolingParams(dimensions=truncate_dim)
-    
-    outputs = embedding_model.embed(sentences, pooling_params=pooling_params, use_tqdm=False)
-    sentences_embeddings = np.array([output.outputs.embedding for output in outputs])
-    
+    setup_embedding_model(embedding_model_name)
+
+    if embedding_framework is LlmFramework.HF:
+        with torch.inference_mode():
+            sentences_embeddings = embedding_models[embedding_model_name].encode(sentences, show_progress_bar=False, prompt_name="Classification", convert_to_numpy=True) 
+
+    elif embedding_framework is LlmFramework.VLLM:
+        # sentences = [get_embedding_prompt(embedding_model_name, sentence) for sentence in sentences]
+        embedding_model = embedding_models[embedding_model_name]
+        truncate_dim = params.get('embedding_dim', 128)
+        pooling_params = PoolingParams(dimensions=truncate_dim)
+            
+        outputs = embedding_model.embed(sentences, pooling_params=pooling_params, truncate_prompt_tokens=-1, use_tqdm=False)
+        sentences_embeddings = np.array([output.outputs.embedding for output in outputs])
+
     return sentences_embeddings
 
 def setup_llm(model_name, num_log_probs = 1000, gpu_ids_=[0]):
@@ -145,7 +164,6 @@ def setup_llm(model_name, num_log_probs = 1000, gpu_ids_=[0]):
         llm_framework = get_llm_framework(model_name)
 
         gpu_ids = gpu_ids_
-        os.environ['CUDA_VISIBLE_DEVICES'] = ",".join([str(gpu_id) for gpu_id in gpu_ids])
 
         HF_HOME = os.environ.get('HF_HOME')
         cache_dir = os.environ.get('HF_HUB_CACHE', HF_HOME)
@@ -171,25 +189,14 @@ def setup_llm(model_name, num_log_probs = 1000, gpu_ids_=[0]):
                     seed=42,
                     # dtype='float16', # for deterministic results. bf16 has slight precision issues, which make matrix operations non-deterministic
                     # enable_chunked_prefill=False, 
-                    max_num_batched_tokens=40000, 
-                    max_num_seqs=8,  # Force sequential processing
+                    max_num_batched_tokens=200000, 
+                    max_num_seqs=8,  
                     enable_prefix_caching=True,
                     # enforce_eager=True,
                     limit_mm_per_prompt={"image": 0}, # to skip initialization of vision tower of multimodel models
                     max_logprobs=num_log_probs,
                     download_dir=cache_dir,
-                    gpu_memory_utilization=0.75,
-                    # compilation_config={"compile_sizes": [1]},
-                    # kv_transfer_config={"kv_connector":"LMCacheConnectorV1", "kv_role":"kv_both"},
-                    compilation_config=CompilationConfig(
-                        # pass_config=PassConfig(
-                        #     fuse_allreduce_rms=True,
-                        #     eliminate_noops=False
-                        # ),
-                        compile_sizes=[1],
-                        cudagraph_mode="FULL",  # or "PIECEWISE" if you hit IMA errors
-                        cudagraph_capture_sizes=[1],
-                    ),
+                    gpu_memory_utilization=0.85,
                     trust_remote_code=True
                 )
                 
@@ -226,9 +233,7 @@ def setup_llm(model_name, num_log_probs = 1000, gpu_ids_=[0]):
                     
                 infer_model.eval()
                 logger.info(f"Loaded {model_name} via HF")
-                
-        del os.environ['CUDA_VISIBLE_DEVICES']
-        
+                        
         if llm_framework in (LlmFramework.VLLM, LlmFramework.HF):
             setup_tokenizer(model_snapshot_or_card, cache_dir)
 
@@ -249,7 +254,7 @@ def setup_tokenizer(model_name, cache_dir):
         
 def setup_calibrator(params):
     global calibrator
-    device = f'cuda:{gpu_ids[0]}'
+    device = f'cuda:0'
 
     with open(f"calibration/models/transformer_config.json", 'r') as file:
         config = json.load(file)
@@ -264,16 +269,6 @@ def setup_calibrator(params):
     ).to(device)
     
     model_path = params.get('calibrator_model_path')
-    # if model_path is None:
-    #     if params['llm_agnostic']:
-    #         model_dir = f"./calibration/models/llm_agnostic"
-    #     else:
-    #         model_dir = f"./calibration/models/{params['model'].replace('/','_')}"
-            
-    #     # if sampling_strategy:
-    #     #     model_dir += f"/{sampling_strategy}"
-            
-    #     model_path = f'{model_dir}/{params['calibrator_name']}'
         
     if model_path is None:
         model_path = f"./calibration/models/llm_agnostic/{params['calibrator_name']}"
@@ -287,7 +282,7 @@ def transformer_calibrate(params:Dict, inputs: torch.Tensor, logits: torch.Tenso
     global calibrator
     if calibrator is None:
         setup_calibrator(params)
-    device=f'cuda:{gpu_ids[0]}'
+    device=f'cuda:0'
     
     calibrator.eval()
     with torch.no_grad():
@@ -339,41 +334,6 @@ def transformer_calibrate(params:Dict, inputs: torch.Tensor, logits: torch.Tenso
     
     logger.info("Transformer calibrated logits")  
     return calibrated_logits
-
-def transformer_calibrate_tmp(params:Dict, inputs: torch.Tensor, logits: torch.Tensor):
-    # global gpu_id
-    global calibrator
-    if calibrator is None:
-        setup_calibrator(params)
-    device=f'cuda:{gpu_id}'
-    
-    calibrator.eval()
-    with torch.no_grad():
-        inputs = inputs.to(device) # len(eval),T,C | len(eval),T,num_classes | len(eval),T
-        logits = logits.to(device)
-        
-        B, T, num_classes = logits.shape
-        
-        calibrated_pred_probs = calibrator(inputs) # B,T,1
-        calibrated_pred_probs = torch.clamp(calibrated_pred_probs, min=1/num_classes + 2e-2, max = 1.0 - 2e-2)
-    
-        temperatures = get_equivalent_temp(logits, calibrated_pred_probs)  # (B, 1, num_classes) (B, 1, 1)
-        temperatures = torch.nan_to_num(temperatures, nan=1.0)
-        calibrated_logits = logits*temperatures # (B, num_classes) * (B,1)
-        
-        print(temperatures[:, -1, :].mean().item(), temperatures[:, -1, :].min().item(), temperatures[:, -1, :].max().item())
-        print(calibrated_pred_probs[:, -1, :].mean().item(), calibrated_pred_probs[:, -1, :].min().item(), calibrated_pred_probs[:, -1, :].max().item(), calibrated_pred_probs[:, -1, :].std().item())
-        
-        calibrated_probs, calibrated_preds = torch.nn.functional.softmax(calibrated_logits, dim=-1).max(dim=-1)
-        print(calibrated_probs[:, -1].mean().item(), calibrated_probs[:, -1].min().item(), calibrated_probs[:, -1].max().item(), calibrated_probs[:, -1].std().item())
-        
-        # print(temperatures.mean().item(), temperatures.min().item(), temperatures.max().item())
-        # print(calibrated_pred_probs.mean().item(), calibrated_pred_probs.min().item(), calibrated_pred_probs.max().item(), calibrated_pred_probs.std().item())
-        # calibrated_probs = calibrated_logits.softmax(dim=-1).max(dim=-1).values
-        # print(calibrated_probs.mean().item(), calibrated_probs.min().item(), calibrated_probs.max().item(), calibrated_probs.std().item())
-        # print(temperatures[:, -1, :].shape, logits.shape)
-        
-    return calibrated_logits[:, -1, :]
 
 def complete_generation_hf(prompts, num_log_probs=None):
     ''' This function runs GPT-2 locally but places the outputs into an json that looks just like the one
@@ -502,11 +462,9 @@ def complete_generation_hf(prompts, num_log_probs=None):
         # exit()
         return return_json
     
-def complete_generation_vllm(prompts, num_log_probs=None, seed=None):
+def complete_generation_vllm(prompts, num_log_probs=None):
     ''' This function runs inference using vLLM but places the outputs into a json that looks just like the one
      provided by the OpenAI API. '''
-
-    assert seed is not None, "Please set a seed for determinism"
     
     if isinstance(prompts, str):
         prompts = [prompts]  # the code below assumes a list
@@ -519,7 +477,7 @@ def complete_generation_vllm(prompts, num_log_probs=None, seed=None):
         logprobs=num_log_probs if num_log_probs is not None else None,
         prompt_logprobs=None,  # We don't need prompt logprobs
         skip_special_tokens=True,
-        seed=seed,
+        seed=42,
     )
     
     # Generate using vLLM
@@ -676,7 +634,7 @@ def complete_generation_google(prompts, num_log_probs=None):
     # print(return_json); exit()
     return return_json
 
-def complete_generation(prompt, num_log_probs=None, seed=None):
+def complete_generation(prompt, num_log_probs=None):
     """complete the prompt using a language model"""
     global llm_framework
      
@@ -684,7 +642,7 @@ def complete_generation(prompt, num_log_probs=None, seed=None):
         case LlmFramework.GOOGLE:
             return complete_generation_google(prompt, num_log_probs=num_log_probs)
         case LlmFramework.VLLM:
-            return complete_generation_vllm(prompt, num_log_probs=num_log_probs, seed=seed)
+            return complete_generation_vllm(prompt, num_log_probs=num_log_probs)
         case LlmFramework.HF:
             return complete_generation_hf(prompt, num_log_probs=num_log_probs)
 
@@ -711,7 +669,7 @@ def construct_base_prompt(params, train_sentences, train_labels, test_sentence):
     prompt += q_prefix + test_sentence + "\n"
     
     assert a_prefix[-1] == ' '
-    prompt += a_prefix[:-1] # GPT models do not want a trailing space, so we cut off -1
+    prompt += a_prefix[:-1] # no trailing space, so that modle outputs ' labeltoken'
     # if(len(train_sentences))==0:
     # print(prompt)
     # exit()
@@ -759,7 +717,7 @@ def populate_trie_recursive(prompt_prefix, path, label_trie, params):
         token_logits = {child_token : 10} 
     else:
         # Generate next token to get logits
-        resp = complete_generation([prompt_prefix], num_log_probs=params['api_num_log_prob'], seed=params['seed'])
+        resp = complete_generation([prompt_prefix], num_log_probs=params['api_num_log_prob'])
         token_logits = resp['choices'][0]['logprobs']['token_logits'][0]
         # if len(path)==0: 
         #     print(token_logits)
@@ -853,7 +811,7 @@ def get_results_bfs(params, train_sentences, train_labels, test_sentences):
         # Fire batch to LLM
         if prompts_to_fire:
             # Complete generation handles list of prompts automatically
-            batch_resp = complete_generation(prompts_to_fire, num_log_probs=params['api_num_log_prob'], seed=params['seed'])
+            batch_resp = complete_generation(prompts_to_fire, num_log_probs=params['api_num_log_prob'])
             
             for i, resp in enumerate(batch_resp['choices']):
                 idx, path = meta_info[i]
@@ -892,8 +850,8 @@ def get_results_bfs(params, train_sentences, train_labels, test_sentences):
     return np.array(all_label_probs), np.array(all_label_raw_logits)
     
 def get_results(params, train_sentences, train_labels, test_sentences):
-    return get_results_dfs(params, train_sentences, train_labels, test_sentences)
-    # return get_results_bfs(params, train_sentences, train_labels, test_sentences)
+    # return get_results_dfs(params, train_sentences, train_labels, test_sentences)
+    return get_results_bfs(params, train_sentences, train_labels, test_sentences)
 
 # Force single-threaded execution to avoid conflicts
 def setup_single_threading():
@@ -904,26 +862,3 @@ def setup_single_threading():
 
     # Set torch to use single thread
     torch.set_num_threads(1)
-    
-    # os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
-    # os.environ['VLLM_USE_PRECOMPILED'] = '1'
-    # os.environ['FLASHINFER_USE_PRECOMPILED'] = '1'
-    # os.environ['VLLM_USE_FLASHINFER_SAMPLER']='0'
-    
-    # for deterministic behaviour
-    # torch.set_num_threads(1)
-    # port = 8100
-    # os.environ["PYTHONHASHSEED"] = "0"
-    # # Use experimental features in LMCache
-    # os.environ["LMCACHE_USE_EXPERIMENTAL"] = "True"
-    # # LMCache is set to use 256 tokens per chunk
-    # os.environ["LMCACHE_CHUNK_SIZE"] = "64"
-    # # Disable local CPU backend in LMCache
-    # os.environ["LMCACHE_LOCAL_CPU"] = "False"
-    # # Set local CPU memory buffer limit to 5.0 GB
-    # os.environ["LMCACHE_MAX_LOCAL_CPU_SIZE"] = "20.0"
-    # # Set the remote URL for LMCache server
-    # os.environ["LMCACHE_REMOTE_URL"] = f"lm://localhost:{port}"
-    # # Set the serializer/deserializer between vllm and LMCache server
-    # # `naive` indicates using raw bytes of the tensor without any compression
-    # os.environ["LMCACHE_REMOTE_SERDE"] = "naive"

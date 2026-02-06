@@ -1,5 +1,12 @@
 from enum import Enum
 
+class Calibformer(Enum):
+    GEMMA_EMBED=0
+    '''Transformer Calibrator using Gemma embeddings'''
+    QWEN_EMBED=1
+    '''Transformer Calibrator using Qwen embeddings'''
+    
+
 class CalibrationMethods(Enum):
     
     GC=0
@@ -24,4 +31,6 @@ class CalibrationMethods(Enum):
     '''Without intervention'''
     FS_ICT=10
     '''Temperature scaling learned from predictions on the k In-Context examples with random (k-1)/2 shot(Fixed Shot) prompts constructed from the In-Context examples'''
-    
+    TF_QE=11
+    '''Transformer Calibrator using Qwen embeddings'''
+

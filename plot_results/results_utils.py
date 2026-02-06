@@ -1,21 +1,31 @@
 from pathlib import Path
-import time
 from typing import List
 import numpy as np
+import matplotlib.pyplot as plt
 import pickle
 from sampling_strategies import EntropyLevels, SamplingStrategy
 from calibration_methods import CalibrationMethods
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-SAVE_DIR_TMP = ROOT_DIR/"saved_results"
+SAVE_DIR_TMP = ROOT_DIR/"saved_results_final"
 
-method_name_map = {
+METHOD_NAME_MAP = {
     CalibrationMethods.UNCALIBRATED: "Uncalibrated",
+    CalibrationMethods.ICC: "ICC",
+    CalibrationMethods.PERMUT_AVG: "ICPermutation",
+    CalibrationMethods.ICT: "TS-AR",
+    CalibrationMethods.FS_ICT: "TS-FS",
     CalibrationMethods.TF: "Calibformer",
-    CalibrationMethods.ICT: "ICT",
-    CalibrationMethods.FS_ICT: "FS ICT",
-    CalibrationMethods.ICC: "In-Context Calibration",
-    CalibrationMethods.PERMUT_AVG: "Examples Permutation avg",
+}
+
+colours = plt.cm.tab10(np.linspace(0, 1, len(METHOD_NAME_MAP)))
+METHOD_COLOUR_MAP = {
+    CalibrationMethods.UNCALIBRATED: colours[0],
+    CalibrationMethods.ICC: colours[1],
+    CalibrationMethods.PERMUT_AVG: colours[2],
+    CalibrationMethods.ICT: colours[3],
+    CalibrationMethods.FS_ICT: colours[4],
+    CalibrationMethods.TF: colours[5],
 }
 
 def cvt_to_sampling_type(sampling_strategy: str):

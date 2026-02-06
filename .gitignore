@@ -8,7 +8,6 @@
 **/calibrator_*
 
 setup.sh
-vllm_test.py
 
 results/
 saved_results/

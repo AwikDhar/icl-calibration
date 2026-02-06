@@ -1,19 +1,29 @@
 from copy import deepcopy
+from enum import Enum
 import os
 from pathlib import Path
 import pickle
-from typing import Callable
+from typing import Callable, Dict
 from llm_framework import LlmFramework
 import numpy as np
 import torch
 import random
+from sampling_strategies import SamplingStrategy
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-SAVE_DIR = ROOT_DIR/"saved_results"
+SAVE_DIR = ROOT_DIR/"saved_results_final"
 
 if not os.path.isdir(SAVE_DIR):
     os.mkdir(SAVE_DIR)
     print(f"Created {SAVE_DIR} for saving results")
+
+class OverWriteType(Enum):
+    FULL=0
+    "Overwrite the saved reults with current results completely"
+    LOAD=1
+    "Load existing results, overwrite current results, save full results"
+    SKIP=2
+    "Skip seeds with saved results"
 
 def normalize_distribution(p, epsilon=1e-9):
     """
@@ -61,6 +71,27 @@ def load_pickle(params):
     print(f"Loaded data from {file_name}")
     return data
 
+def load_results(params_list):
+    # load saved results from model
+    result_tree = dict()
+    for params in params_list:
+        saved_result = load_pickle(params)
+        match params['sampling_strategy']:
+            case SamplingStrategy.ENTROPY:
+                exp_setting = params['entropy_level']
+            case SamplingStrategy.SIMILARITY:
+                exp_setting = 'similarity_sampling'
+
+        keys = [params['dataset'], params['model'], exp_setting, params['num_shots']]
+        
+        node = result_tree # root
+        for k in keys:
+            if not (k in node.keys()):
+                node[k] = dict()
+            node = node[k]
+        node[params['seed']] = saved_result['accuracies']
+    print_results(result_tree)
+    
 def print_results(tree, calibration_methods=[], log:Callable = print):
     calibration_methods = [method.name for method in calibration_methods]
     
@@ -109,19 +140,6 @@ def print_results(tree, calibration_methods=[], log:Callable = print):
                         log(f"{names[i]} | Mean: {m:.4f}, Low: {l:.4f}, High: {h:.4f}, Std: {s:.4f}")
                     print()
 
-def load_results(params_list):
-    # load saved results from model
-    result_tree = dict()
-    for params in params_list:
-        saved_result = load_pickle(params)
-        keys = [params['dataset'], params['model'], params['entropy_levels'], params['num_shots']]
-        node = result_tree # root
-        for k in keys:
-            if not (k in node.keys()):
-                node[k] = dict()
-            node = node[k]
-        node[params['seed']] = saved_result['accuracies']
-    print_results(result_tree)
     
 
 def convert_to_list(items, cvt_func=None):
@@ -129,7 +147,14 @@ def convert_to_list(items, cvt_func=None):
         return [cvt_func(s.strip()) for s in items.split(",")]
     else:
         return [s.strip() for s in items.split(",")]
-    
+
+def get_saved_results_file_name(params: Dict):
+        sampling_strategy = params['entropy_level'].name if params['sampling_strategy']==SamplingStrategy.ENTROPY else SamplingStrategy.SIMILARITY.name
+        file_name = (f"{SAVE_DIR}/{params['model'].replace('/','_').replace('-FP8','')}/{params['dataset']}/" # In case it's an HF model
+                 f"{sampling_strategy}/{params['num_shots']}_shot/{params['seed']}_seed.pkl") 
+        
+        return file_name
+        
 def fix_seed(seed):
     """For deterministic training."""
     random.seed(seed)

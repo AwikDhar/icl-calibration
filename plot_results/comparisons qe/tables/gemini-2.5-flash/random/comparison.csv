@@ -1,0 +1,8 @@
+,Calibration Methods,,,,,,,,,
+,Uncalibrated,,ICT,,FS ICT,,Calibformer,,Tf Qe,
+Datasets,Ece,BRIER,Ece,BRIER,Ece,BRIER,Ece,BRIER,Ece,BRIER
+amazon_counterfactual,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan
+commonsense_qa,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan
+medqa,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan
+when2call,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan
+Average,nan,nan,nan,nan,nan,nan,nan,nan,nan,nan

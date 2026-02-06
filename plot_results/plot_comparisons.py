@@ -3,9 +3,19 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from calibration_methods import CalibrationMethods
-from plot_results.results_utils import get_saved_results, cvt_to_sampling_type, method_name_map, SAVE_DIR_TMP, ROOT_DIR
+from plot_results.results_utils import get_saved_results, cvt_to_sampling_type, SAVE_DIR_TMP, ROOT_DIR, METHOD_NAME_MAP, METHOD_COLOUR_MAP
 
 PLOT_DIR = ROOT_DIR / "plot_results" / "comparisons"
+
+plt.rcParams.update({
+    'font.size': 25,        
+    'lines.linewidth': 2.5,
+    'grid.linewidth': 1.5,
+    'xtick.labelsize': 20,    
+    'ytick.labelsize': 20,    
+    'legend.fontsize': 20,    
+    'axes.labelsize': 25      
+})
 
 def convert_to_list(items, cvt_func=None):
     if cvt_func:
@@ -44,7 +54,6 @@ def plot_metric_comparison(
     fig, ax = plt.subplots(figsize=(10, 6))
     
     # Generate colors dynamically
-    colors = plt.cm.tab10(np.linspace(0, 1, len(calibration_methods)))
     
     # Plot each calibration method
     for idx, calibration_method in enumerate(calibration_methods):
@@ -68,10 +77,10 @@ def plot_metric_comparison(
             method_name = 'Uncalibrated'
             marker = 'o'
         else:
-            method_name = method_name_map.get(calibration_method, calibration_method.name.replace('_', ' ').title())
+            method_name = METHOD_NAME_MAP.get(calibration_method, calibration_method.name.replace('_', ' ').title())
             marker = 's'
 
-        color = colors[idx]
+        color = METHOD_COLOUR_MAP[calibration_method]
         ax.plot(all_shots, means, marker=marker, label=method_name, 
                 color=color, linewidth=2, markersize=6)
         ax.fill_between(all_shots, means - stds, means + stds, 
@@ -80,8 +89,8 @@ def plot_metric_comparison(
     # Formatting
     ax.set_xlabel('Number of Shots', fontsize=12, fontweight='bold')
     ax.set_ylabel(get_metric_display_name(metric), fontsize=12, fontweight='bold')
-    ax.set_title(f"{get_metric_display_name(metric)}\n{model} on {dataset} ({sampling_strategy.name})",
-                 fontsize=14, fontweight='bold', pad=20)
+    # ax.set_title(f"{get_metric_display_name(metric)}\n{model} on {dataset} ({sampling_strategy.name})",
+    #              fontsize=14, fontweight='bold', pad=20)
     ax.legend(loc='best', frameon=True, shadow=True, fontsize=10)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.set_xticks(all_shots)
@@ -162,7 +171,6 @@ def plot_all_metrics(
                     )
 
     print(f"\n✓ All plots generated successfully! Saved to {save_dir}")
-
 
 def main(args):    
     sampling_strategies = [cvt_to_sampling_type(s) for s in args.sampling_strategies.split(",")]

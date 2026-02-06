@@ -151,15 +151,15 @@ def recalculate_features(item: Dict, temp_augment=False, label_augment=False):
     permute_embeddings = True
     if permute_embeddings:
         embedding = item['inputs'][:, 46:]
-        idxs = torch.randperm(128, device=item["inputs"].device)
-        permuted_embeddings = embedding[:, idxs]
+        # idxs = torch.randperm(128, device=item["inputs"].device)
+        permuted_embeddings = embedding#[:, idxs]
 
         item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, permuted_embeddings), dim=-1)
         # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], permuted_embeddings), dim=-1)
     else:
-        item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs), dim=-1)
+        # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs), dim=-1)
         # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3]), dim=-1)
-        # item['inputs'] = item['inputs'][:,:2]
+        item['inputs'] = item['inputs'][:,:2]
         
     # print(item['inputs']); exit()
     # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], item['inputs'][:, 25:46]), dim=-1)

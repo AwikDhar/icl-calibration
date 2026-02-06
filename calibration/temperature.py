@@ -159,7 +159,7 @@ def get_combined_shotwise_static_temperatures(data, shots_start):
     
     return tuned_temps
 
-def tune_temp_for_sequence(logits_seq: torch.TensorType, labels_seq: torch.TensorType, 
+def tune_temp_for_sequence_gd(logits_seq: torch.TensorType, labels_seq: torch.TensorType, 
                            temp_init: torch.TensorType = None, iterations: int = 500, lr: float = 0.01):
     """Train a temp for each sequence of predictions for each sequence in batch
 
@@ -198,7 +198,75 @@ def tune_temp_for_sequence(logits_seq: torch.TensorType, labels_seq: torch.Tenso
             break
     
     return temperatures.detach()        
+
+def tune_temp_for_sequence(logits_seq: torch.TensorType, labels_seq: torch.TensorType,
+                           temp_init: torch.TensorType = None, 
+                           temp_min: float = 0.01, temp_max: float = 100.0,
+                           max_iterations: int = 500, tolerance: float = 1e-4):
+    """Find optimal temperature for each sequence using binary search on the loss landscape.
     
+    Args:
+        logits_seq (torch.TensorType): (B, k-shots, num_classes) 
+        labels_seq (torch.TensorType): (B, k-shots)
+        temp_init (torch.TensorType): (B,) initial temperatures (optional)
+        temp_min (float): minimum temperature bound
+        temp_max (float): maximum temperature bound
+        max_iterations (int): maximum binary search iterations
+        tolerance (float): convergence tolerance
+    
+    Returns:
+        temperatures (torch.TensorType): (B,) optimized temperatures
+    """
+    B, K, num_classes = logits_seq.shape
+    device = logits_seq.device
+    
+    if temp_init is None:
+        temperatures = torch.ones(B, device=device)
+    else:
+        temperatures = temp_init.clone()
+    
+    # Initialize search bounds for each sequence
+    temp_low = torch.full((B,), temp_min, device=device)
+    temp_high = torch.full((B,), temp_max, device=device)
+    
+    def compute_loss(temps):
+        """Helper to compute loss for given temperatures"""
+        calibrated_logits = logits_seq * temps.view(B, 1, 1)
+        loss_per_sample = F.cross_entropy(
+            calibrated_logits.reshape(B*K, num_classes),
+            labels_seq.reshape(B*K),
+            reduction='none'
+        ).reshape(B, K).mean(dim=1)  # (B,)
+        return loss_per_sample
+    
+    # Use ternary search for each batch element
+    for iteration in range(max_iterations):
+        # Check convergence
+        if (temp_high - temp_low).max() < tolerance:
+            break
+        
+        # Ternary search: evaluate at two interior points
+        mid1 = temp_low + (temp_high - temp_low) / 3
+        mid2 = temp_high - (temp_high - temp_low) / 3
+        
+        loss_mid1 = compute_loss(mid1)
+        loss_mid2 = compute_loss(mid2)
+        
+        # Update bounds based on which midpoint has lower loss
+        # If loss_mid1 < loss_mid2, optimum is in [low, mid2]
+        # If loss_mid2 < loss_mid1, optimum is in [mid1, high]
+        mask_left = loss_mid1 < loss_mid2
+        temp_high = torch.where(mask_left, mid2, temp_high)
+        temp_low = torch.where(mask_left, temp_low, mid1)
+    
+    # Final temperature is midpoint of converged range
+    temperatures = (temp_low + temp_high) / 2
+    
+    with torch.no_grad():
+        temperatures.clamp_(0.01, 100.0)
+        
+    return temperatures
+
 def get_shotwise_dynamic_temperatures(data, shots_start):
     logits, labels = data['logits'], data['labels'] # len(eval),T,num_classes | len(eval),T
     
