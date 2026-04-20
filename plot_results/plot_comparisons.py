@@ -3,7 +3,8 @@ from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 from calibration_methods import CalibrationMethods
-from plot_results.results_utils import get_saved_results, cvt_to_sampling_type, SAVE_DIR_TMP, ROOT_DIR, METHOD_NAME_MAP, METHOD_COLOUR_MAP
+from plot_results.results_utils import get_saved_results, cvt_to_sampling_type, get_metric_display_name
+from plot_results.results_utils import SAVE_DIR_TMP, ROOT_DIR, METHOD_NAME_MAP, METHOD_COLOUR_MAP
 
 PLOT_DIR = ROOT_DIR / "plot_results" / "comparisons"
 
@@ -23,22 +24,18 @@ def convert_to_list(items, cvt_func=None):
     else:
         return [s.strip() for s in items.split(",")]
 
-def get_metric_display_name(metric):
-    """Convert metric key to display name."""
-    return metric.upper().replace('_', ' ')
-
-def plot_metric_comparison(
+def plot_metrics_row(
     results_dict,
     model,
     dataset,
     sampling_strategy,
     all_shots,
     calibration_methods,
-    metric,
+    metrics,
     save_dir=PLOT_DIR
 ):
     """
-    Plot comparison of calibration methods for a specific metric.
+    Plot comparison of calibration methods for multiple metrics in a row.
     
     Args:
         results_dict: Nested dictionary from get_saved_results
@@ -47,69 +44,81 @@ def plot_metric_comparison(
         sampling_strategy: SamplingStrategy enum
         all_shots: List of shot counts
         calibration_methods: List of CalibrationMethods to compare
-        metric: Metric to plot
+        metrics: List of metrics to plot
         save_dir: Directory to save plots
     """
-    # Create figure
-    fig, ax = plt.subplots(figsize=(10, 6))
+    n_metrics = len(metrics)
     
-    # Generate colors dynamically
+    # Create figure with subplots in a row
+    # Adjust figure width based on number of metrics
+    fig_width = 8 * n_metrics
+    fig, axes = plt.subplots(1, n_metrics, figsize=(fig_width, 6))
     
-    # Plot each calibration method
-    for idx, calibration_method in enumerate(calibration_methods):
-        means = []
-        stds = []
+    # Ensure axes is always a list for consistent indexing
+    if n_metrics == 1:
+        axes = [axes]
+    
+    # Plot each metric
+    for metric_idx, metric in enumerate(metrics):
+        ax = axes[metric_idx]
         
-        for num_shots in all_shots:
-            # try:
-            data = results_dict[dataset][model][sampling_strategy][num_shots][calibration_method]
-            means.append(data[metric]['mean'])
-            stds.append(data[metric]['std'])
-            # except KeyError:
-            #     means.append(np.nan)
-            #     stds.append(np.nan)
-        
-        means = np.array(means)
-        stds = np.array(stds)
-        
-        # Create method label
-        if calibration_method == CalibrationMethods.UNCALIBRATED:
-            method_name = 'Uncalibrated'
-            marker = 'o'
-        else:
-            method_name = METHOD_NAME_MAP.get(calibration_method, calibration_method.name.replace('_', ' ').title())
-            marker = 's'
+        # Plot each calibration method
+        for idx, calibration_method in enumerate(calibration_methods):
+            means = []
+            stds = []
+            
+            for num_shots in all_shots:
+                data = results_dict[dataset][model][sampling_strategy][num_shots][calibration_method]
+                means.append(data[metric]['mean'])
+                stds.append(data[metric]['std'])
+            
+            means = np.array(means)
+            stds = np.array(stds)
+            
+            # Create method label
+            if calibration_method == CalibrationMethods.UNCALIBRATED:
+                method_name = 'Uncalibrated'
+                marker = 'o'
+            else:
+                method_name = METHOD_NAME_MAP.get(calibration_method, calibration_method.name.replace('_', ' ').title())
+                marker = 's'
 
-        color = METHOD_COLOUR_MAP[calibration_method]
-        ax.plot(all_shots, means, marker=marker, label=method_name, 
-                color=color, linewidth=2, markersize=6)
-        ax.fill_between(all_shots, means - stds, means + stds, 
-                         alpha=0.2, color=color)
+            color = METHOD_COLOUR_MAP[calibration_method]
+            ax.plot(all_shots, means, marker=marker, label=method_name, 
+                    color=color, linewidth=2, markersize=6)
+            ax.fill_between(all_shots, means - stds, means + stds, 
+                             alpha=0.2, color=color)
+        
+        # Formatting for this subplot
+        ax.set_xlabel('Number of Shots')
+        ax.set_ylabel(get_metric_display_name(metric))
+        ax.grid(True, alpha=0.3, linestyle='--')
+        ax.set_xticks(all_shots)
+        
+        # Set y-axis to start from 0 for ECE
+        bottom = 0 if metric == 'ece' else None
+        ax.set_ylim(bottom=bottom)
     
-    # Formatting
-    ax.set_xlabel('Number of Shots', fontsize=12, fontweight='bold')
-    ax.set_ylabel(get_metric_display_name(metric), fontsize=12, fontweight='bold')
-    # ax.set_title(f"{get_metric_display_name(metric)}\n{model} on {dataset} ({sampling_strategy.name})",
-    #              fontsize=14, fontweight='bold', pad=20)
-    ax.legend(loc='best', frameon=True, shadow=True, fontsize=10)
-    ax.grid(True, alpha=0.3, linestyle='--')
-    ax.set_xticks(all_shots)
+    # Create a single legend below all subplots
+    # Get handles and labels from the first subplot (they're all the same)
+    handles, labels = axes[0].get_legend_handles_labels()
     
-    # Set y-axis to start from 0 for better comparison
-    # ylim = ax.get_ylim()
-    bottom = 0 if metric=='ece' else None
-    ax.set_ylim(bottom=bottom)
+    # Add legend below the subplots
+    fig.legend(handles, labels, loc='lower center', ncol=len(calibration_methods),
+               bbox_to_anchor=(0.5, -0.05), frameon=True, shadow=True)
     
+    # Adjust layout to make room for legend
     plt.tight_layout()
+    plt.subplots_adjust(bottom=0.25)
     
     # Save plot
     model_name = model.replace('/', '_').replace('-FP8', '')
-    save_path = save_dir / model_name / dataset / sampling_strategy.name
+    save_path = save_dir / model_name / "datasets/plots" / dataset / sampling_strategy.name
     save_path.mkdir(parents=True, exist_ok=True)
     
-    filename = save_path / f"{metric}_comparison.png"
-    plt.savefig(filename, dpi=300, bbox_inches='tight')
-    # print(f"Saved plot: {filename}")
+    metrics_str = '_'.join(metrics)
+    filename = save_path / f"{metrics_str}_comparison.png"
+    plt.savefig(filename, dpi=400, bbox_inches='tight')
     
     plt.close()
 
@@ -158,17 +167,16 @@ def plot_all_metrics(
     for model in models:
         for dataset in datasets:
             for sampling_strategy in sampling_strategies:
-                for metric in metrics:
-                    plot_metric_comparison(
-                        results_dict=results_dict,
-                        model=model,
-                        dataset=dataset,
-                        sampling_strategy=sampling_strategy,
-                        all_shots=all_shots,
-                        calibration_methods=calibration_methods,
-                        metric=metric,
-                        save_dir=save_dir
-                    )
+                plot_metrics_row(
+                    results_dict=results_dict,
+                    model=model,
+                    dataset=dataset,
+                    sampling_strategy=sampling_strategy,
+                    all_shots=all_shots,
+                    calibration_methods=calibration_methods,
+                    metrics=metrics,
+                    save_dir=save_dir
+                )
 
     print(f"\n✓ All plots generated successfully! Saved to {save_dir}")
 

@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 import numpy as np
 from matplotlib import pyplot as plt
-from plot_results.results_utils import cvt_to_sampling_type, get_saved_results
+from plot_results.results_utils import cvt_to_sampling_type, get_saved_results, get_metric_display_name
 from calibration_methods import CalibrationMethods
 from sampling_strategies import SamplingStrategy
 from utils.gen_utils import convert_to_list
@@ -16,10 +16,6 @@ plt.rcParams.update({
     'legend.fontsize': 20,    
     'axes.labelsize': 25      
 })
-
-def get_metric_display_name(metric):
-    """Convert metric key to display name."""
-    return metric.upper() + "(%)" if metric.lower()!='brier' else ""
 
 def main(models, datasets, num_seeds, all_shots, sampling_strategies, metric='ece'):
     results = get_saved_results(models, datasets, num_seeds, all_shots, sampling_strategies, 
@@ -64,31 +60,29 @@ def main(models, datasets, num_seeds, all_shots, sampling_strategies, metric='ec
                                 color=cmap(i), alpha=0.2)
 
             # Axis 1: Accuracy
-            ax1.set_title("Accuracy")
             ax1.set_xlabel("Shots")
-            ax1.set_ylabel("Accuracy(%)")
+            ax1.set_ylabel("Accuracy")
             ax1.grid(True, alpha=0.3)
 
             # Axis 2: Specified metric
             metric_display = get_metric_display_name(metric)
-            ax2.set_title(metric_display)
             ax2.set_xlabel("Shots")
             ax2.set_ylabel(metric_display)
             ax2.grid(True, alpha=0.3)
 
             handles, labels = ax1.get_legend_handles_labels()
-            fig.legend(handles, labels, loc='lower center', ncol=len(datasets), 
-                      labelspacing=0, frameon=True)
+            fig.legend(handles, labels, loc='lower center', ncol=len(datasets),
+                        bbox_to_anchor=(0.5, -0.01), frameon=True, shadow=True)
             
             plt.tight_layout()
-            plt.subplots_adjust(bottom=0.25)  
+            plt.subplots_adjust(bottom=0.28)  
             
             save_dir = Path(f"./plot_results/baseline/{model_save_name}/{sampling_strategy.name}")
             save_dir.mkdir(parents=True, exist_ok=True)
             
             # Save with dynamic filename based on metric
             filename = f"accuracy_{metric}.png"
-            fig.savefig(save_dir / filename, dpi=600) 
+            fig.savefig(save_dir / filename, dpi=400) 
             print(f"Saved plot: {save_dir / filename}")
             plt.close(fig)
 

@@ -1,5 +1,6 @@
 import argparse
 import os
+import pprint
 import shutil
 from tqdm import tqdm 
 import numpy as np
@@ -15,30 +16,10 @@ from losses import compute_binned_ce, smooth_ece
 
 from calibration_methods import CalibrationMethods
 from sampling_strategies import SamplingStrategy
-from calibration.generate_calibration_dataset import get_autoregressive_results, get_shifted_features, generate_data_class_agnostic_with_embeddings
+from calibration.generate_calibration_dataset import get_autoregressive_results, get_shifted_features
 
-import logging
-
-logFormatter = logging.Formatter(
-    "{asctime} - {levelname} - {message}", 
-    style="{",
-    datefmt="%Y-%m-%d %H:%M:%S"
-)
-logger = logging.getLogger(__name__)
-logger.propagate=False
-
-fileHandler = logging.FileHandler(ROOT_DIR/"calibration.log")
-fileHandler.setFormatter(logFormatter)
-logger.addHandler(fileHandler)
-
-consoleHandler = logging.StreamHandler()
-consoleHandler.setFormatter(logFormatter)
-logger.addHandler(consoleHandler)
-
-logger.setLevel(logging.INFO)
-
-SAVE_DIR_TMP = ROOT_DIR/"saved_results_final"
-os.makedirs(SAVE_DIR_TMP, exist_ok=True)
+# SAVE_DIR_TMP = ROOT_DIR/"saved_results_final"
+# os.makedirs(SAVE_DIR_TMP, exist_ok=True)
     
 def save_pickle_tmp(params, data):
     # save results from model
@@ -128,13 +109,15 @@ def run_and_save_results(params_list: List[Dict], datasets: Dict):#, min_confide
 
     for _, params in tqdm(enumerate(params_list), total=len(params_list), desc="Processing experiments", smoothing=0.8):
         fix_seed(params['seed'])
+        
         file_name = get_saved_results_file_name(params)
         if os.path.isfile(file_name) and params['overwrite_type'] is OverWriteType.SKIP:
             logging.info(f"Skipping experiment shot {params['num_shots']} seed {params['seed']}, already done before.")
             continue
-        
         logger.info(params)
+        # pprint.pprint(params)
         logger.info("\nExperiment name: %s", params['expr_name'])
+        logger.info("\nSave dir: %s", get_saved_results_file_name(params))
         
         ### load data
         start = time()
@@ -155,6 +138,7 @@ def run_and_save_results(params_list: List[Dict], datasets: Dict):#, min_confide
         num_shots = params['num_shots'] 
         calibration_methods = params.get('calibration')
         has_calibration_set = set(calibration_methods).intersection({CalibrationMethods.GC, CalibrationMethods.BC, CalibrationMethods.BTF, CalibrationMethods.PTF})             
+        # print(logger.handlers); exit()
 
         train_sentences, train_labels, train_embeddings = [], [], [] 
             
@@ -194,10 +178,11 @@ def run_and_save_results(params_list: List[Dict], datasets: Dict):#, min_confide
 
         elif params['sampling_strategy']==SamplingStrategy.SIMILARITY:
             shuffle_examples = random.sample([0,1], 1)[0]  # 50% odds of the in-context examples being sorted by similarity
+            
             if params['subsample_test_set']>=len(all_test_sentences) and not shuffle_examples and params['seed']>0:
                 logger.warning("Found less test inputs in dataset than requested, saving seed 0 results to avoid repeated experiments")
                 model_name = params['expr_name'].replace('/','_') # In case it's an HF model
-                file_name = os.path.join(SAVE_DIR_TMP, f"{model_name}.pkl")
+                file_name = os.path.join(SAVE_DIR, f"{model_name}.pkl")
                 shutil.copy(file_name.replace(f"seed{params['seed']}", 'seed0'), file_name)
                 continue
             
@@ -209,24 +194,20 @@ def run_and_save_results(params_list: List[Dict], datasets: Dict):#, min_confide
             train_sentences, train_embeddings, train_labels = sampled_data.sentences, sampled_data.embeddings, sampled_data.labels
             
         logger.info("Time taken to load %s dataset: %d sec", params['dataset'], round(time()-start))
-        # print(np.array(train_embeddings).shape, np.array(test_embeddings).shape) ; exit()
+
         # for prompt construction
         set_prompt_params(params)   
 
-        ### Evaluate the performance and save all results
         logger.info(f"getting raw resp for {len(test_sentences)} test sentences with {num_shots} ICL examples.")
         
-        # check determinism
-        # for i in range(3):
-        #     print(test_sentences[i]); 
-        # exit()
-        probs, logits = get_results(params, train_sentences, train_labels, test_sentences)
+        # if all the labels are distinguishable by their first token, only 1 llm call per query prediction will be made, we can get IC example predictions conveniently
+        single_depth_label_trie = len(LabelsTrie(params['label_dict']).root.children) == len(params['label_dict'])
+        in_context_logprobs = single_depth_label_trie and get_llm_framework(params['model'])==LlmFramework.HF
 
-        # print(all_label_probs[-1][0])
-        # assert np.array_equal(all_label_probs, all_label_probs2), f"{all_label_probs[-10:], all_label_probs2[-10:]}"
-        # assert np.array_equal(all_label_raw_logits,all_label_raw_logits2) 
-        # assert np.array_equal(np.argmax(all_label_probs, axis=-1), np.argmax(all_label_raw_logits, axis=-1)), f"Probs: {all_label_probs[-5:]}, Logits: {all_label_raw_logits[-5:]}"
-
+        llm_result = get_results(params, train_sentences, train_labels, test_sentences, in_context_logprobs=in_context_logprobs)
+        probs = np.array([llm_result.logprobs[i].probs[0] for i in range(len(test_sentences))])
+        logits = np.array([llm_result.logprobs[i].logits[0] for i in range(len(test_sentences))])
+        
         acc_original, conf_ori = eval_accuracy(probs, test_labels)
         ece_original = smooth_ece(logits, test_labels)
         mce_original = compute_binned_ce(logits, test_labels).mce
@@ -240,20 +221,33 @@ def run_and_save_results(params_list: List[Dict], datasets: Dict):#, min_confide
         calibrated_logits = {}
         if calibration_methods is not None:
             if set(calibration_methods).intersection({CalibrationMethods.TF, CalibrationMethods.ICT}):
-                train_probs, train_logits = get_autoregregressive_train_results(params, train_sentences, train_labels)
-                logger.info("Generated autoregressive predictions over in context examples")
+                if in_context_logprobs:
+                    train_logits = np.array([llm_result.in_context_logprobs[test_idx].logits for test_idx in range(len(test_sentences))])
+                else:
+                    train_probs, train_logits = get_autoregregressive_train_results(params, train_sentences, train_labels)
+                    logger.info("Generated autoregressive predictions over in context examples")
 
                 combined_logits = np.concatenate([train_logits, np.expand_dims(logits, axis=1)], axis=1)
                 combined_labels = np.array([train_labels[i] + [-1] for i in range(len(test_sentences))]) # dummy test label for methods that expect k+1 labels
 
             if CalibrationMethods.TF in calibration_methods:
-                calibrated_logits[CalibrationMethods.TF] = get_tc_logits(params, train_sentences, train_labels, train_logits, test_sentences, logits, 'google/embeddinggemma-300m')
+                combined_sentences = [train_sentences[test_idx] + [test_sentences[test_idx]] for test_idx in range(len(test_sentences))]
+                calibrated_logits[CalibrationMethods.TF] = get_tc_logits(params, combined_sentences, train_labels, train_logits, logits, 'google/embeddinggemma-300m')
+                # calibrated_logits[CalibrationMethods.TF] = get_tc_logits(params, combined_sentences, train_labels, train_logits, calibrated_logits[CalibrationMethods.TF], 'google/embeddinggemma-300m')
                 metrics[CalibrationMethods.TF] = ClassificationMetrics(logits, calibrated_logits[CalibrationMethods.TF], test_labels)
-                # assert np.array_equal(np.argmax(logits, axis=-1), np.argmax(probs, axis=-1))
-                # assert np.array_equal(np.argmax(calibrated_logits, axis=-1), np.argmax(logits, axis=-1))
             
+            if CalibrationMethods.TF_HF in calibration_methods:
+                train_hidden = [llm_result.in_context_logprobs[test_idx].hidden_features for test_idx in range(len(test_sentences))]
+                test_hidden = [llm_result.logprobs[test_idx].hidden_features for test_idx in range(len(test_sentences))]
+                combined_hidden = [train_hidden[test_idx] + test_hidden[test_idx] for test_idx in range(len(test_sentences))]
+                
+                calibrated_logits[CalibrationMethods.TF_HF] = get_tc_logits(params, combined_hidden, train_labels, train_logits, logits, 'hidden_features')
+                # calibrated_logits[CalibrationMethods.TF_HF] = get_tc_logits(params, combined_hidden, train_labels, train_logits, calibrated_logits[CalibrationMethods.TF_HF], 'hidden_features')
+                metrics[CalibrationMethods.TF_HF] = ClassificationMetrics(logits, calibrated_logits[CalibrationMethods.TF_HF], test_labels)
+                
             if CalibrationMethods.TF_QE in calibration_methods:
-                calibrated_logits[CalibrationMethods.TF_QE] = get_tc_logits(params, train_sentences, train_labels, train_logits, test_sentences, logits, 'Qwen/Qwen3-Embedding-4B')
+                combined_sentences = [train_sentences[test_idx] + [test_sentences[test_idx]] for test_idx in range(len(test_sentences))]
+                calibrated_logits[CalibrationMethods.TF_QE] = get_tc_logits(params, combined_sentences, train_labels, train_logits, logits, 'Qwen/Qwen3-Embedding-4B')
                 metrics[CalibrationMethods.TF_QE] = ClassificationMetrics(logits, calibrated_logits[CalibrationMethods.TF_QE], test_labels)
             
             if CalibrationMethods.ICT in calibration_methods:
@@ -425,7 +419,9 @@ def get_fs_ict_logits(params, train_sentences, train_labels, test_sentences, log
         fs_test_sentences = [train_sentences[test_sentence_idx][fs_test_sentence_idx] for fs_test_sentence_idx in range(num_shots)]
         fs_test_labels = [train_labels[test_sentence_idx][fs_test_sentence_idx] for fs_test_sentence_idx in range(num_shots)]
             
-        _, fs_logits = get_results(params, fs_train_sentences, fs_train_labels, fs_test_sentences)
+        llm_result = get_results(params, fs_train_sentences, fs_train_labels, fs_test_sentences)
+        # probs = np.array([llm_result.logprobs[i].probs[0] for i in range(len(test_sentences))])
+        fs_logits = np.array([llm_result.logprobs[i].logits[0] for i in range(len(fs_test_sentences))])
         cur_combined_logits = np.vstack([fs_logits, logits[test_sentence_idx]])
         cur_combined_labels = fs_test_labels + [-1] # dummy label since it isn't needed for temperature scaling calculation
         
@@ -454,23 +450,22 @@ def get_fs_ict_logits(params, train_sentences, train_labels, test_sentences, log
     
 def get_tc_logits(
     params: Dict, 
-    train_sentences: List[str],
+    combined_sentences: List[str] | List[np.ndarray],
     train_labels: List[int],
     train_logits: np.ndarray,
-    test_sentences: List[str],
     logits: np.ndarray,
     embedding_model_name: str):
 
     inputs_batch = []
     for i in range(len(logits)):
-        inputs = generate_calibrator_inputs(params, train_sentences[i], train_labels[i], train_logits[i].copy(), test_sentences[i], logits[i].copy(), embedding_model_name)
+        inputs = generate_calibrator_inputs(params, combined_sentences[i], train_labels[i], train_logits[i].copy(), logits[i].copy(), embedding_model_name)
         inputs_batch.append(inputs)
     
     inputs_batch = torch.stack(inputs_batch)
     logits = torch.tensor(logits)
     
     B, T, C = inputs_batch.shape
-    assert (B, T) == (len(train_sentences), len(train_sentences[-1])+1), f"{(B, T)} vs {(len(train_sentences), len(train_sentences[-1])+1)} mismatch"
+    assert (B, T) == (len(combined_sentences), len(combined_sentences[-1])), f"{(B, T)} vs {(len(combined_sentences), len(combined_sentences[-1]))} mismatch"
     
     params['tc_input_dim'] = inputs_batch[0].shape[-1]
     calibrated_logits = transformer_calibrate(params, inputs_batch, logits)
@@ -479,10 +474,9 @@ def get_tc_logits(
 
 def generate_calibrator_inputs(
     params: Dict,
-    train_sentences: List[str],
+    combined_sentences: List[str] | List[np.ndarray],
     train_labels: List[int],
     train_logits: np.ndarray,
-    test_sentence:str,
     test_logits: np.ndarray,
     embedding_model_name: str):
         
@@ -500,7 +494,7 @@ def generate_calibrator_inputs(
     shifted_features = get_shifted_features(probs, preds, train_labels+train_labels[-1:]) 
     
     lower_dim_embeddings = torch.tensor(get_embeddings(params, 
-                                                       sentences=train_sentences + [test_sentence],
+                                                       sentences=combined_sentences,
                                                        embedding_model_name=embedding_model_name), 
                                         dtype=torch.float32)
     # noise = torch.rand_like(lower_dim_embeddings)
@@ -607,11 +601,14 @@ def get_prompt_semantic_prior(params, sentences, labels):
 
 def eval_accuracy(all_label_probs, test_labels):
     correctness_list, prob_list = [], []
+    
     low_prob_count = 0
     mean_min_conf = np.min(all_label_probs, axis=-1).mean()
+    
     if mean_min_conf==0:
-        logger.warning(f"Mean min prediction confidence: {mean_min_conf}, check if your label tokens are appropriate. Probs: {all_label_probs}")
+        raise ValueError(f"Mean min prediction confidence: {mean_min_conf}, check if your label tokens are appropriate. Probs: {all_label_probs[-2]}")
     assert len(all_label_probs) == len(test_labels)
+    
     for i, (label_probs, true_label) in enumerate(zip(all_label_probs, test_labels)):
         # print("Label probs:", label_probs)
         if np.max(label_probs)<0.1: 
@@ -619,7 +616,7 @@ def eval_accuracy(all_label_probs, test_labels):
             # logger.warning(f"Your unnormalised probs are sketchy: {label_probs}, check for logical errors")
             # logger.info(raw_resp[i]['logprobs']['top_logprobs'][0])
             # exit()
-        # print(label_probs, type(label_probs), label_probs.shape)
+        # print(label_probs, type(label_probs), label_probs.shape); exit()
         label_probs = label_probs / np.sum(label_probs) # normalize to 1
         ans_conf = np.max(label_probs)
         ans_label = np.argmax(label_probs)
@@ -744,5 +741,14 @@ if __name__ == '__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = ",".join([str(gpu_id) for gpu_id in args['gpu_ids']])
     setup_vllm_env_settings()
     from utils.run_utils import *
+    # logger.handlers.clear()
+
+    logger = setup_logger(__name__)
+    logger.propagate=False 
     
+    # logging.getLogger().setLevel(logging.INFO)  # keep root quiet
+    # logger.setLevel(logging.INFO)  # your main logger
+    # logging.getLogger('utils.run_utils').setLevel(logging.INFO)
+    # logging.getLogger(__name__).setLevel(logging.INFO)
+
     main(**args)

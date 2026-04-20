@@ -1,11 +1,21 @@
 import random
 from typing import Dict, List, Optional
 import msgspec
+import numpy as np
 from tqdm import tqdm
 
 import torch
 import torch.nn.functional as F
 
+def fix_seed(seed):
+    random.seed(seed)
+    np.random.seed(seed)
+
+    torch.manual_seed(seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed(seed)
+        torch.cuda.manual_seed_all(seed)
+        
 def get_batch(data: Dict, batch_size: Optional[int] = None):
     N = data["inputs"].shape[0] # dataset size
     if batch_size is None:
@@ -15,7 +25,6 @@ def get_batch(data: Dict, batch_size: Optional[int] = None):
         data["labels"],
     )
         
-    # idxs = torch.randint(N, (batch_size,), device=data["inputs"].device)
     idxs = torch.randperm(N, device=data["inputs"].device)[:batch_size]
     return (
         data["inputs"][idxs],
@@ -51,6 +60,7 @@ def load_datasets(
         
         for split in splits:
             has_nan_count = 0
+            corrupt_count = 0
             
             path = f"calibration/datasets/{llm.replace('/','_')}/{dataset}/{feature_type}/{split}.json"
             with open(path) as file:
@@ -88,12 +98,18 @@ def load_datasets(
                             else:
                                 raise NotImplementedError(f"Task specification for recalculating features not reccognised: {task}")
                         
-                        filtered_split_data.append(sampling_split_data[idx])
+                        if sampling_split_data[idx].get('corrupt', False):
+                            corrupt_count += 1
+                        else:
+                            filtered_split_data.append(sampling_split_data[idx])
 
                     nan_percentage = (has_nan_count / total_items * 100) if total_items > 0 else 0
+                    corrupt_percentage = (corrupt_count / total_items * 100) if total_items > 0 else 0
                     if nan_percentage>0:
                         print(f"{llm} | {dataset} | {split}: {nan_percentage:.2f}% items with NaN ({has_nan_count}/{total_items})")
-
+                    if corrupt_percentage>0:
+                        print(f"{llm} | {dataset} | {split}: {corrupt_percentage:.2f}% items with corrupt features ({corrupt_count}/{total_items})")
+                        
                     # breakpoint()
                     # batchify entire dataset (only non-NaN items)
                     inputs_all = torch.stack([item["inputs"] for item in filtered_split_data])
@@ -108,6 +124,17 @@ def load_datasets(
 
     return data
 
+def reshuffle_embeddings(data: Dict):
+    """Reshuffle the embedding dimensions across all inputs in the data dict."""
+    for llm in data:
+        for dataset in data[llm]:
+            for sampling_strategy in data[llm][dataset]:
+                if "train" in data[llm][dataset][sampling_strategy]:
+                    inputs = data[llm][dataset][sampling_strategy]["train"]["inputs"]
+                    embedding_dim = inputs.shape[-1] - 5
+                    idxs = torch.randperm(embedding_dim, device=inputs.device)
+                    inputs[:, :, -embedding_dim:] = inputs[:, :, -embedding_dim:][..., idxs]
+                    
 def recalculate_features(item: Dict, temp_augment=False, label_augment=False):
     device = item['inputs'].device
     # print(item['inputs'])
@@ -147,19 +174,73 @@ def recalculate_features(item: Dict, temp_augment=False, label_augment=False):
     # gt_prob_mses = torch.zeros((T,1), device=device)
     # gt_prob_mses[0,0] = 0.5
     # gt_prob_mses[1:,[0]] = (1 - item['inputs'][1:,[2]])**2
-
-    permute_embeddings = True
+    knn = False
+    permute_embeddings = False
     if permute_embeddings:
-        embedding = item['inputs'][:, 46:]
+        embedding: torch.Tensor = item['inputs'][:, 46:]
+        # embedding = embedding/embedding.norm(dim=-1, keepdim=True)
+        
         # idxs = torch.randperm(128, device=item["inputs"].device)
-        permuted_embeddings = embedding#[:, idxs]
+        # permuted_embeddings = embedding[:, idxs]
+        permuted_embeddings = embedding
+        # embeddings = embedding - embedding.mean(dim=0)
+        # norms = embeddings.norm(dim=-1, keepdim=True)
 
+        # low_norm_mask = norms.squeeze(-1) < 1e-2
+        # if low_norm_mask.any():
+        #     item['corrupt'] = True
+        #     # print("Corrupt item")
+        #     return
+        #     # print(f"Low norm embeddings found: {low_norm_mask.sum().item()} / {len(norms)}")
+        #     # print(f"Norms: {norms[low_norm_mask].squeeze()}")
+        #     # print(f"Embeddings:\n{embeddings[low_norm_mask]}")
+        #     # print(f"Original embeddings:\n{embedding[low_norm_mask]}")
+        #     # print(f"probabilities: \n{pred_probs}")
+        #     # print(f"Correctness labels: \n{item['inputs'][:, 1]}")
+        #     # print(f"Labels: \n{item['labels']}")
+        # assert torch.min(norms)>0.01
+        
         item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, permuted_embeddings), dim=-1)
         # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], permuted_embeddings), dim=-1)
+    elif knn == True:
+        input_sims  = item['inputs'][:, 4 + T : 4 + 2 * T]  # (T, T) causal
+        correctness = item['inputs'][:, 1]                    # correctness[j+1] = was pred_j correct?
+
+        knn_confidence     = torch.zeros(T, 1, device=device)
+        knn_sim_to_nearest = torch.zeros(T, 1, device=device)
+        sim_temperature    = 1
+
+        for t in range(T):
+            if t == 0:
+                knn_confidence[t, 0]     = 0.5
+                knn_sim_to_nearest[t, 0] = 0.0
+                continue
+
+            similarities                  = input_sims[t, :t]       # all t neighbours
+            neighbour_correctness = correctness[1 : t + 1]  # correctness[j+1] = was pred_j correct?
+
+            weights = F.softmax(similarities / sim_temperature, dim=0)
+            knn_confidence[t, 0]     = (weights * neighbour_correctness).sum()
+            knn_sim_to_nearest[t, 0] = similarities.max()
+
+        item['inputs'] = torch.cat(
+            (gt_prob_mses, item['inputs'][:, :3], second_highest_probs, knn_confidence, knn_sim_to_nearest),
+            dim=-1
+        )  # → (T, 7)
     else:
         # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs), dim=-1)
+        is_entropy = torch.tensor([
+            [float(item['sampling_strategy']=='ENTROPY')]
+            for _ in range(len(probs))
+            ], device=device
+        )
+        item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, is_entropy), dim=-1)
+        # embedding: torch.Tensor = item['inputs'][:, -128:]
+        # norms = embedding.norm(dim=-1, keepdim=True)
+        # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, item['inputs'][:, 25:46]), dim=-1)
+
         # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3]), dim=-1)
-        item['inputs'] = item['inputs'][:,:2]
+        # item['inputs'] = item['inputs'][:,:2]
         
     # print(item['inputs']); exit()
     # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], item['inputs'][:, 25:46]), dim=-1)
@@ -173,7 +254,7 @@ def recalculate_features(item: Dict, temp_augment=False, label_augment=False):
     # print(item['logits'].argmax(dim=-1).float())
     # print(item['labels'].float()); exit()
     # print(item['inputs'][-10:,:25])
-    # print(item['inputs'][-5:,:50])
+    # print(item['inputs'][:10,:50], item['sampling_strategy'])
     # exit()
     # add_noise_to_features(item)
  

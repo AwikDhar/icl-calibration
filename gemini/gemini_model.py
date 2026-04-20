@@ -89,15 +89,16 @@ class GeminiModel():
                 if attempt==self.retry_attempt-1:
                     raise ce
                 
-                sleept_time = (attempt + 1)*5
-                print(f"{ce.__repr__()}\nRetrying in {sleept_time} sec...")
-                time.sleep(sleept_time)
+                sleep_time = (attempt + 1)*7
+                print(f"{ce.__repr__()}\nRetrying in {sleep_time} sec...")
+                time.sleep(sleep_time)
             except Exception as e:
                 if attempt==self.retry_attempt-1:
                     raise e
                 
-                print(f"{e.__repr__()}\nRetrying in {sleept_time} sec...")
-                time.sleep(sleept_time)
+                sleep_time = (attempt + 1)*7
+                print(f"{e.__repr__()}\nRetrying in {sleep_time} sec...")
+                time.sleep(sleep_time)
                 
                 continue
 

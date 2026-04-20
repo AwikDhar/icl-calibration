@@ -33,4 +33,7 @@ class CalibrationMethods(Enum):
     '''Temperature scaling learned from predictions on the k In-Context examples with random (k-1)/2 shot(Fixed Shot) prompts constructed from the In-Context examples'''
     TF_QE=11
     '''Transformer Calibrator using Qwen embeddings'''
+    TF_HF=12
+    '''Transformer Calibrator using Hidden Features as the embeddings'''
+    
 

@@ -3,8 +3,10 @@ from typing import Dict, List
 import numpy as np
 
 from utils.sampling_utils import get_similarities 
-from utils.gen_utils import js_divergence
+from utils.gen_utils import get_llm_framework, js_divergence
 from utils.run_utils import get_results, get_embeddings
+from labels_trie import LabelsTrie
+from llm_framework import LlmFramework
 
 def generate_data_non_causal(params: Dict, sentences: List[str], embeddings: np.ndarray, labels: List[int]):
     data = {
@@ -149,49 +151,26 @@ def generate_data_class_agnostic_with_embeddings(params: Dict, sentences: List[s
         "labels": labels
     }
     
-    num_classes = len(params['label_dict'])
+    # num_classes = len(params['label_dict'])
 
-    all_label_probs, all_label_raw_logits = get_autoregressive_results(params, sentences, labels)
+    probs, logits, lower_dim_embeddings = get_autoregressive_results_with_embeddings(params, sentences, labels) 
         
-    row_sums = np.sum(all_label_probs, axis=-1, keepdims=True)
-    if np.any(row_sums == 0):
-        print("Zero probs in here! :", all_label_probs)
-        print(sentences)
-        print(labels)      
-        
-    probs = all_label_probs/row_sums
     preds = np.argmax(probs, axis=-1)
     pred_probs = probs[np.arange(len(preds)), preds]
-    
+    # print(preds.shape, probs.shape); exit()
     shifted_features = get_shifted_features(probs, preds, labels)
-
-    normalized_entropies = -(probs@np.log(probs.T + 1e-9)).diagonal() / np.log(num_classes) # (B, num_classes) × (num_classes, B) --> (B, B) --> diagonal elements
-
-    input_similarity_vectors = np.tril(get_similarities(embeddings, embeddings)) # only lower triangular to make it causal
     
-    lower_dim_embeddings = get_embeddings(params, sentences)
-    
-    T = len(sentences) # number of timesteps
-    pred_similarity_vectors = np.zeros((T, T))
-    for timestep in range(T):
-        for prev_timestep in range(timestep + 1):  # only compute for j <= i (causal)
-            js_div = js_divergence(probs[timestep], probs[prev_timestep])
-            pred_similarity_vectors[timestep, prev_timestep] = 1 - (js_div / np.log(2))  # Maps [0, log(2)] → [1, 0]
-
-    # Input to the calibration transformer is a concatenation of t<k shot probs, similarities and other features
+    # Input to the calibration transformer is a concatenation of t<k shot probs, embeddings and other features
     data['inputs'] = [
         np.concatenate((
             [pred_probs[sent_idx]], 
             [shifted_features.correctness[sent_idx]], 
             [shifted_features.gt_probs[sent_idx]], 
-            [normalized_entropies[sent_idx]],
-            pred_similarity_vectors[sent_idx], 
-            input_similarity_vectors[sent_idx],
             lower_dim_embeddings[sent_idx]
         )).tolist()
         for sent_idx in range(len(sentences))
     ]
-    data['logits'] = all_label_raw_logits.tolist()
+    data['logits'] = logits.tolist()
 
     # with np.printoptions(precision=3, suppress=True):
     #     print(np.array(data['inputs'])[:, :4+2*T])
@@ -204,14 +183,42 @@ def generate_data_class_agnostic_with_embeddings(params: Dict, sentences: List[s
     # exit()
     return data
 
+def get_autoregressive_results_with_embeddings(params: Dict, sentences: List[str], labels: List[int]):
+    single_depth_label_trie = len(LabelsTrie(params['label_dict']).root.children) == len(params['label_dict'])
+    in_context_logprobs = single_depth_label_trie and get_llm_framework(params['model'])==LlmFramework.HF
+    
+    if in_context_logprobs:
+        train_sentences = [sentences[:-1]]
+        train_labels = [labels[:-1]]
+        test_sentences = [sentences[-1]]
+        
+        llm_result = get_results(params, train_sentences, train_labels, test_sentences, in_context_logprobs=in_context_logprobs)
+        logprobs = llm_result.logprobs[0]
+        in_context_logprobs = llm_result.in_context_logprobs[0]
+        
+        probs = logprobs.probs + in_context_logprobs.probs
+        logits = logprobs.logits + in_context_logprobs.logits
+        sentences = logprobs.hidden_features + in_context_logprobs.hidden_features
+        # print(len(probs), len(logprobs.probs), len(in_context_logprobs.probs), len(sentences))
+        embedding_model_name = "hidden_features"
+    else:
+        probs, logits = get_autoregressive_results(params, sentences, labels)
+        embedding_model_name = "google/embeddinggemma300m"
+        
+    lower_dim_embeddings = get_embeddings(params, sentences, embedding_model_name=embedding_model_name)
+    
+    return np.array(probs), np.array(logits), lower_dim_embeddings
+    
 def get_autoregressive_results(params: Dict, sentences: List[str], labels: List[int]):
     # LLM's logits(y|x, C) to be calibrated by transformer's output T
     train_sentences = [sentences[:sent_idx] for sent_idx in range(len(sentences))]
     train_labels = [labels[:sent_idx] for sent_idx in range(len(sentences))]
     test_sentences = [sentences[sent_idx] for sent_idx in range(len(sentences))]
     
-    probs, logits = get_results(params, train_sentences, train_labels, test_sentences)
-    
+    llm_result = get_results(params, train_sentences, train_labels, test_sentences, in_context_logprobs=False)
+    probs = np.array([llm_result.logprobs[i].probs[0] for i in range(len(test_sentences))])
+    logits = np.array([llm_result.logprobs[i].logits[0] for i in range(len(test_sentences))])
+
     return probs, logits
 
 # def get_autoregressive_results(params: Dict, sentences: List[str], labels: List[int]):

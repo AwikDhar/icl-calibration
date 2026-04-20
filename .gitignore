@@ -5,10 +5,9 @@
 *.pkl
 *.pt
 # *.png
-**/calibrator_*
+**/calibrator*
 
 setup.sh
-
 results/
 saved_results/
 saved_results

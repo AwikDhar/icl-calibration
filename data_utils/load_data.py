@@ -22,7 +22,8 @@ def load_dataset_with_embeddings(dataset:str, split:str):
 
     for item in dataset:
         if item['label']<0:
-            continue
+            raise ValueError(f"Item with label {item['label']} found. Please check for data quality.")
+            # continue
         sentences.append(item['sentence'])
         labels.append(item['label'])
         embeddings.append(item['sentence_embedding'])

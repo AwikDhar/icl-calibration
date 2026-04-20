@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from plot_results.results_utils import cvt_to_sampling_type, get_saved_results, method_name_map, ROOT_DIR, SAVE_DIR_TMP
+from plot_results.results_utils import cvt_to_sampling_type, get_saved_results, METHOD_NAME_MAP, ROOT_DIR, SAVE_DIR
 from calibration_methods import CalibrationMethods
 from utils.gen_utils import convert_to_list
 
@@ -100,7 +100,7 @@ def create_comparison_table(results, model, datasets, all_shots, sampling_strate
         if method == CalibrationMethods.UNCALIBRATED:
             method_name = 'Uncalibrated'
         else:
-            method_name = method_name_map.get(method, method.name.replace('_', ' ').title())
+            method_name = METHOD_NAME_MAP.get(method, method.name.replace('_', ' ').title())
   
         for metric in metrics:
 
@@ -206,7 +206,7 @@ def main(args):
     calibration_methods = [CalibrationMethods[m.upper()] for m in args.calibration_methods]
     
     # Set results directory
-    results_dir = Path(args.results_dir) if args.results_dir else SAVE_DIR_TMP
+    results_dir = Path(args.results_dir) if args.results_dir else SAVE_DIR
     
     # Load results
     print("Loading experimental results...")
@@ -282,7 +282,7 @@ if __name__ == "__main__":
                        help='Whther to tabulate standard deviations along with means')
     parser.add_argument('--results_dir', type=str, default=None,
                        help='Directory containing saved results')
-    parser.add_argument('--output_dir', type=str, default='plot_results/comparisons/tables',
+    parser.add_argument('--output_dir', type=str, default='plot_results/comparisons_rebuttal/20_samples/tables',
                        help='Output directory for tables')
     parser.add_argument('--csv_name', type=str, default=None,
                        help='Custom CSV filename (default: comparison.csv)')

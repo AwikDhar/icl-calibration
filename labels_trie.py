@@ -5,9 +5,10 @@ import torch
 class TrieNode:
     def __init__(self):
         self.children: Dict[str, 'TrieNode'] = {}
-        self.logit: float = None
+        self.logit: float = 10
         self.labels: List[str] = []
-
+        self.hidden_features = None
+        
 class LabelsTrie:
     def __init__(self, label_map: Dict[str, List[str]]):
         self.root = TrieNode()
@@ -28,7 +29,6 @@ class LabelsTrie:
         for token in path:
             node = node.children[token]
         for token in node.children:
-            # node.children[token].logit = token_logits.get(token, float("-inf"))
             token_variants = [
                     token,                    # exact match
                     token.capitalize(),       # capitalized
@@ -40,29 +40,16 @@ class LabelsTrie:
             token_variants = list(set(token_variants))
             
             # 64 bit precision is important to prevent overflow(inf)
-            # if not any([tk in token_logits for tk in token_variants]):
-            #     print(token_logits, token_variants)
             logit_variants = torch.tensor([token_logits.get(tk, float('-inf')) for tk in token_variants], dtype=torch.float64) 
             logit = torch.logsumexp(logit_variants, dim=0).cpu().numpy()
-            # if token.lstrip() in token_logits:
-            #     logit = token_logits[token.lstrip()]
-            # elif token in token_logits:
-            #     logit = token_logits[token]
-            # elif token.capitalize() in token_logits:
-            #     logit = token_logits[token.]
-            # else:
-            #     logit = float("-inf")
-            # logit = max(token_logits.get(token, float("-inf")), 
-            #             token_logits.get(token.capitalize(), float("-inf")))
+
             node.children[token].logit = logit
         # if node==self.root and np.sum(np.exp([child.logit for child in node.children.values()]))==0:
         #     print(token_logits); exit()
-            # print(token_logits); exit()
     def get_label_prob(self, tokens: List[str]) -> float:
         node = self.root
         probs = []
         
-        # print(tokens)
         for token in tokens:
             logits = [child.logit for child in node.children.values()]
             token_logit = node.children[token].logit

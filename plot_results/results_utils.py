@@ -7,7 +7,7 @@ from sampling_strategies import EntropyLevels, SamplingStrategy
 from calibration_methods import CalibrationMethods
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-SAVE_DIR_TMP = ROOT_DIR/"saved_results_final"
+SAVE_DIR = ROOT_DIR/"saved_results_rebuttal/20_samples"
 
 METHOD_NAME_MAP = {
     CalibrationMethods.UNCALIBRATED: "Uncalibrated",
@@ -34,7 +34,11 @@ def cvt_to_sampling_type(sampling_strategy: str):
     except:
         return EntropyLevels[sampling_strategy.upper()]
         
-def get_saved_results(models, datasets, num_seeds, all_shots, sampling_strategies, calibration_methods: List[CalibrationMethods]=[], results_dir=SAVE_DIR_TMP):
+def get_metric_display_name(metric):
+    """Convert metric key to display name."""
+    return metric.upper() if metric.lower()!='brier' else metric.title()
+
+def get_saved_results(models, datasets, num_seeds, all_shots, sampling_strategies, calibration_methods: List[CalibrationMethods]=[], results_dir=SAVE_DIR):
     root_node = dict()
     missing_exprs = []
 

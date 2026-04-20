@@ -1,5 +1,6 @@
 from collections import deque
 import json 
+import pprint
 import random
 from typing import Dict, List
 
@@ -13,8 +14,8 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from calibration.model import CalibrationTransformer, PositionEmbeddingType, CalibratorOutputType
-from calibration.temperature import get_equivalent_temp
-from calibration.data_utils import load_datasets, get_batch
+from calibration.temperature import get_equivalent_temp, get_equivalent_temp_gd
+from calibration.data_utils import fix_seed, load_datasets, get_batch, reshuffle_embeddings
 
 from losses import BrierLoss
 from utils.gen_utils import convert_to_list
@@ -60,6 +61,8 @@ def main(llms: List[str],
          batch_size: int,
          ablation_method: str,
          num_seeds: int,
+         seed_start: int,
+         seed_train_ds_count: int | None,
          model_name: str,
          resume_saved_ckpt: bool,
          gpu_id: int,
@@ -93,16 +96,20 @@ def main(llms: List[str],
     sample_model, sample_dataset, sample_strategy = llms[0], datasets[0], sampling_strategies[0]
     T, C = data[sample_model][sample_dataset][sample_strategy]['train']['inputs'][0].shape
     
+    seed_train_ds_count = seed_train_ds_count or len(datasets)
+    
     # seeds>1 means deterministic training and seed specific checkpoints
-    for seed in range(num_seeds):
-        # if seeds>1:
-        #     fix_seed(seed)
+    for seed in range(seed_start, num_seeds):
+        if num_seeds>1:
+            fix_seed(seed)
         
+        seed_train_ds = random.sample(datasets, seed_train_ds_count)
+        # print(seed_train_ds_count); exit()
         model_dir = f"./calibration/models/"+ (llms[0].replace('/','_') if len(llms)==1 else 'llm_agnostic')
         if len(sampling_strategies)==1:
             model_dir += f"/{sampling_strategies[0]}"
         if ablation_method:
-            model_dir += f"/{ablation_method}"
+            model_dir += f"/ablations/{ablation_method}"
         if num_seeds>1:
             model_dir += f"/{seed}_seed"
             
@@ -149,12 +156,12 @@ def main(llms: List[str],
             calibrator, 
             calibrator_output_type,
             data,
+            seed_train_ds,
             datasets_dropout,
             iterations,
             lr,
             eval_iter,
             batch_size,
-            device,
             model_path,
             metrics_path,
             resume_saved_ckpt, 
@@ -164,12 +171,12 @@ def main(llms: List[str],
 def train(model: nn.Module, 
           calibrator_output_type: CalibratorOutputType,
           data: Dict, 
+          seed_train_ds: List[str],
           datasets_dropout: float,
           iterations: int, 
           lr: float,
           eval_iter: int,
           batch_size: int,
-          device: str,
           model_path: str,
           metrics_path: str,
           resume_saved_ckpt: bool,
@@ -213,7 +220,7 @@ def train(model: nn.Module,
     datasets = []
     
     for llm in data:
-        for dataset in data[llm]:
+        for dataset in seed_train_ds:
             for sampling_strategy in data[llm][dataset]:
                 if 'train' not in data[llm][dataset][sampling_strategy]:
                     continue
@@ -305,6 +312,9 @@ def train(model: nn.Module,
                 
             if eval_loss<best_eval_loss:
                 best_eval_loss = eval_loss.item()
+                
+        # if (iter+1)%5000:
+        #     reshuffle_embeddings(data)
 
     print(f"\nBest CE loss: {best_eval_loss} \nBest eval calibrated ECE: {best_eval_calibrated_ece} \nBest eval calibrated brier: {best_eval_calibrated_brier}")
       
@@ -333,8 +343,8 @@ def eval(model, calibrator_output_type, data, shots_start, batch_size):
                         continue
                     # print(dataset)
                     inputs, logits, labels = get_batch(data[llm][dataset][sampling_strategy]['test'], batch_size) # B,T,C | B,T,num_classes | B,T
-                    correctness_labels = (logits.argmax(dim=-1)==labels).float()
-                    num_classes = logits.shape[-1]
+                    # correctness_labels = (logits.argmax(dim=-1)==labels).float()
+                    # num_classes = logits.shape[-1]
                                     
                     outputs = model(inputs) # B,T,1
                     calibrated_logits, loss = get_calibrated_logits_loss(logits, outputs, calibrator_output_type, labels, shots_start)
@@ -371,16 +381,16 @@ def eval(model, calibrator_output_type, data, shots_start, batch_size):
         
         return total_loss, metrics
    
-def get_calibrated_logits_loss(logits, outputs, calibrator_output_type, labels, shots_start):
+def get_calibrated_logits_loss(logits, outputs, calibrator_output_type, labels, shots_start, num_iters=10):
     if calibrator_output_type is CalibratorOutputType.CALIBRATED_PROBABILITY:
-        return get_correctness_calibrated_logits_loss(logits, outputs, labels, shots_start)
+        return get_correctness_calibrated_logits_loss(logits, outputs, labels, shots_start, num_iters)
 
     if calibrator_output_type is CalibratorOutputType.TEMPERATURE:
-        return get_temperature_calibrated_logits_loss(logits, outputs, labels, shots_start)
+        return get_temperature_calibrated_logits_loss(logits, outputs, labels, shots_start, num_iters)
 
-def get_correctness_calibrated_logits_loss(logits, calibrated_pred_probs, labels, shots_start):
+def get_correctness_calibrated_logits_loss(logits, calibrated_pred_probs, labels, shots_start, num_iters):
     correctness_labels = (logits.argmax(dim=-1)==labels).float()        
-    pred_probs, pred_classes = logits.max(dim=-1)  # (B, T, num_classes), (B, T)
+    # pred_probs, pred_classes = logits.max(dim=-1)  # (B, T, num_classes), (B, T)
     
     B,T,num_classes = logits.shape
     
@@ -409,7 +419,8 @@ def get_correctness_calibrated_logits_loss(logits, calibrated_pred_probs, labels
     #                         src=calibrated_pred_probs)
     
     # calibrated_logits = torch.log(calibrated_probs + 1e-5)
-    temperatures = get_equivalent_temp(logits, calibrated_pred_probs, num_iters=10)  # B, T, 1
+    temperatures = get_equivalent_temp(logits, calibrated_pred_probs, num_iters=num_iters)  # B, T, 1
+    # temperatures = get_equivalent_temp_gd(logits, calibrated_pred_probs)  # B, T, 1
     # temperatures = torch.nan_to_num(temperatures, nan=1.0)
     
     calibrated_logits = logits*temperatures
@@ -489,7 +500,7 @@ if __name__ == '__main__':
     # core arguments
     parser.add_argument('--llms', dest='llms', action='store', required=True, help='name of llm(s) to train the calibrator for')
     parser.add_argument('--datasets', dest='datasets', action='store', required=True, help='name of dataset to train the calibrator for')
-    parser.add_argument('--unseen_datasets', action='store', required=False, help='name of dataset to eval the calibrator on')
+    parser.add_argument('--unseen_datasets', action='store', required=True, help='name of dataset to eval the calibrator on')
     parser.add_argument('--shots_end', dest='shots_end', action='store', required=False, type=int, default=None, help='Till which shot # we will do calibration eval')
     parser.add_argument('--datasets_dropout', dest='datasets_dropout', action='store', required=False, default=0.8, help='fraction of datasets randomly dropped out each training iteration')
     parser.add_argument('--feature_type', dest='feature_type', action='store', required=False, default="", help='the type of input features that make up the dataset')
@@ -508,9 +519,12 @@ if __name__ == '__main__':
     parser.add_argument('--batch_size', dest='batch_size', action='store', required=False, type=int, default=32,
                         help='batch size for model training')
     
+    # ablation related
     parser.add_argument('--calibrator_output_type', action='store', required=False, default="calibrated_probability", help='What the transformer calibrator outputs(temperature/calibrated probability)')
     parser.add_argument('--ablation_method', action='store', required=False, default=None, help='Ablation method name, if performing ablation')
     parser.add_argument('--num_seeds', action='store', required=False, default=1, type=int, help='Number of seeds to train calibrators for')
+    parser.add_argument('--seed_start', action='store', required=False, default=0, type=int, help='Which seed # to start training from')
+    parser.add_argument('--seed_train_ds_count', action='store', required=False, default=None, type=int, help='Number of datasets to train given seed with')
     
     # other args
     parser.add_argument('--model_name', dest='model_name', action='store', required=False, default="calibrator", help='custom name for the model(calibrator), used for saving the checkpoints')    
@@ -519,14 +533,12 @@ if __name__ == '__main__':
     
     args = parser.parse_args()
     args = vars(args)
-    print(args)
-         
     args['llms'] = convert_to_list(args['llms'])
     args['datasets'] = convert_to_list(args['datasets'])
     if args.get('unseen_datasets'):
         args['unseen_datasets'] = convert_to_list(args['unseen_datasets'])
     else:
-        logger.warning
+        logger.warning("Using the training datasets as the unseen/validation datasets")
         args['unseen_datasets'] = args['datasets']
         
     args['calibrator_output_type'] = CalibratorOutputType[args['calibrator_output_type'].upper()]
@@ -534,6 +546,9 @@ if __name__ == '__main__':
         args['sampling_strategies'] = convert_to_list(args['sampling_strategies'], lambda s: s.upper())
     else:
         args['sampling_strategies'] = ['ENTROPY', 'SIMILARITY']
+        # args['sampling_strategies'] = ['SIMILARITY', 'ENTROPY']
         
     args_check(args)
+    pprint.pprint(args)
+         
     main(**args)

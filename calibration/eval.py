@@ -1,6 +1,7 @@
 import argparse
 import json
 import os
+from pathlib import Path
 from typing import List
 
 import torch
@@ -48,7 +49,7 @@ def main(llms,
 
     for seed in range(num_seeds):
         if num_seeds>1:
-            print(seed)
+            print(f"Seed : {seed}")
         
         model_dir = f"./calibration/models/"
         if llm_agnostic or len(llms)>1: 
@@ -59,7 +60,7 @@ def main(llms,
         # if len(sampling_strategies)==1:
         #     model_dir += f"/{sampling_strategies[0]}"
         if ablation_method:
-            model_dir += f"/{ablation_method}"
+            model_dir += f"/ablations/{ablation_method}"
         if num_seeds>1:
             model_dir += f"/{seed}_seed"
             
@@ -110,7 +111,29 @@ def main(llms,
     print(f"{'Uncalibrated':<20} {comparison_result_overall.uncalibrated.ece:<10.4f} {comparison_result_overall.uncalibrated.brier:<10.4f}")
     print(f"{'Calibrated':<20} {comparison_result_overall.calibrated.ece:<10.4f} {comparison_result_overall.calibrated.brier:<10.4f}")
     print(f"{'Dynamic Calibrated':<20} {comparison_result_overall.dynamic_calibrated.ece:<10.4f} {comparison_result_overall.dynamic_calibrated.brier:<10.4f}")
+    
+    eval_dir = Path(model_dir)
+    if num_seeds>1:
+        eval_dir = eval_dir.parent
         
+    eval_metrics = {
+        "uncalibrated": {
+            "ece": round(comparison_result_overall.uncalibrated.ece, 4),
+            "brier": round(comparison_result_overall.uncalibrated.brier, 4)
+        },
+        "calibrated": {
+            "ece": round(comparison_result_overall.calibrated.ece, 4),
+            "brier": round(comparison_result_overall.calibrated.brier, 4)
+        },
+        "dynamic_calibrated": {
+            "ece": round(comparison_result_overall.dynamic_calibrated.ece, 4),
+            "brier": round(comparison_result_overall.dynamic_calibrated.brier, 4)
+        }
+    }
+
+    with open(eval_dir / "eval.json", "w") as file:
+        json.dump(eval_metrics, file, indent=2)
+     
 def eval(calibrator, 
          calibrator_output_type,
          data, 
@@ -245,7 +268,7 @@ def eval_llm_dataset(model, calibrator_output_type, data, llm, dataset, sampling
     with torch.no_grad():                        
         outputs = model(inputs) # B,T,1
         
-        calibrated_logits, loss = get_calibrated_logits_loss(logits, outputs, calibrator_output_type, labels, shots_start)
+        calibrated_logits, loss = get_calibrated_logits_loss(logits, outputs, calibrator_output_type, labels, shots_start, num_iters=100)
         temperatures = calibrated_logits/logits #if calibrator_output_type is CalibratorOutputType.CALIBRATED_PROBABILITY else outputs
         
         probs, preds = F.softmax(logits, dim=-1).max(dim=-1)

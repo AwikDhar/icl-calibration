@@ -7,11 +7,12 @@ from typing import Callable, Dict
 from llm_framework import LlmFramework
 import numpy as np
 import torch
+import torch._inductor.config as inductor_config
 import random
 from sampling_strategies import SamplingStrategy
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-SAVE_DIR = ROOT_DIR/"saved_results_final"
+SAVE_DIR = ROOT_DIR/"saved_results_rebuttal"
 
 if not os.path.isdir(SAVE_DIR):
     os.mkdir(SAVE_DIR)
@@ -171,7 +172,10 @@ def setup_vllm_env_settings():
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
     torch.use_deterministic_algorithms(True)  
-
+    # inductor_config.benchmark_combo_kernel = False
+    # inductor_config.fallback_random = True
+    # inductor_config.coordinate_descent_tuning = False
+    # os.environ["VLLM_CONFIGURE_LOGGING"] = "0"
     os.environ['VLLM_WORKER_MULTIPROC_METHOD'] = 'spawn'
     os.environ['VLLM_BATCH_INVARIANT'] = '1'
     os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"

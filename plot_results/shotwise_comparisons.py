@@ -4,7 +4,7 @@ import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from calibration_methods import CalibrationMethods
-from plot_results.results_utils import get_saved_results, cvt_to_sampling_type, SAVE_DIR_TMP, ROOT_DIR, METHOD_NAME_MAP, METHOD_COLOUR_MAP
+from plot_results.results_utils import get_saved_results, cvt_to_sampling_type, SAVE_DIR, ROOT_DIR, METHOD_NAME_MAP, METHOD_COLOUR_MAP
 
 PLOT_DIR = ROOT_DIR / "plot_results" / "comparisons"
 
@@ -450,7 +450,7 @@ if __name__ == "__main__":
                         help='Comma-separated metrics to plot (e.g., "ece,brier,mce")')
     parser.add_argument('--show_std', action='store_true', default=False,
                         help='Whether to show standard deviations in the table (default: False)')
-    parser.add_argument('--results_dir', type=str, default=SAVE_DIR_TMP,
+    parser.add_argument('--results_dir', type=str, default=SAVE_DIR,
                         help='Directory containing saved results of experiments')
     parser.add_argument('--save_dir', type=str, default=str(PLOT_DIR),
                         help='Directory to save dataset-averaged plots and tables')

@@ -1,4 +1,5 @@
 import argparse
+from copy import deepcopy
 import json
 import os
 import random
@@ -7,12 +8,13 @@ from sampling_strategies import SamplingStrategy
 from calibration.calibrator_input_generators import *
 from utils.sampling_utils import *
 from utils.run_utils import *
+from utils.gen_utils import convert_to_list, setup_vllm_env_settings, get_llm_framework
+from utils.sampling_utils import random_sampling, similarity_sampling
 
 from tqdm import tqdm 
 import numpy as np
 from time import time
 import logging
-import multiprocessing as mp
 
 def setup_logger():
     logFormatter = logging.Formatter(
@@ -159,7 +161,7 @@ def generate_calibration_datasets(params_list: List[Dict], datasets: Dict, calib
                 elif sampling_strategy==SamplingStrategy.SIMILARITY:
                     selected_sentences, selected_labels, selected_idxs = random_sampling(all_sentences, all_labels, 1, EntropyLevels.RANDOM) 
                     
-                    shuffle_examples = random.random() < 0.25 # Keep in-context examples sorted by similarity 75% of the time
+                    shuffle_examples = random.random() < 0.5 # Keep in-context examples sorted by similarity 50% of the time
                     selected_embeddings = np.array([all_embeddings[idx] for idx in selected_idxs]) # only 1 idx here
                     sampled_data = similarity_sampling(all_sentences, all_embeddings, all_labels, 
                                                        test_embeddings=selected_embeddings, num_shots=num_shots+1, shuffle=shuffle_examples, return_embeddings=True)
@@ -182,7 +184,7 @@ if __name__ == '__main__':
 
     parser = argparse.ArgumentParser()
     # mp.set_start_method('fork', force=True)
-    setup_single_threading()
+    # setup_single_threading()
     setup_vllm_env_settings()
 
     parser.add_argument('--model', dest='models', action='store', required=True, help='name of model(s), e.g., GPT2-XL')

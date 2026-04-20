@@ -1,8 +1,0 @@
-,Calibration Methods,,,,,,,
-,Uncalibrated,,ICT,,FS ICT,,Calibformer,
-Datasets,Ece,BRIER,Ece,BRIER,Ece,BRIER,Ece,BRIER
-amazon_counterfactual,7.8,0.187,4.3,0.180,4.6,0.180,4.0,0.170
-commonsense_qa,10.6,0.259,9.7,0.281,6.9,0.257,5.7,0.247
-medqa,8.3,0.206,11.6,0.249,5.7,0.211,4.8,0.200
-when2call,9.4,0.228,4.9,0.206,5.3,0.210,3.6,0.199
-Average,9.0,0.220,7.6,0.229,5.6,0.214,4.5,0.204
