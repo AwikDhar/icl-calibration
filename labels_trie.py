@@ -5,7 +5,7 @@ import torch
 class TrieNode:
     def __init__(self):
         self.children: Dict[str, 'TrieNode'] = {}
-        self.logit: float = 10
+        self.logit: float = None
         self.labels: List[str] = []
         self.hidden_features = None
         

@@ -7,6 +7,7 @@ from typing import List
 import torch
 import torch.nn.functional as F
 import numpy as np
+from tqdm import tqdm
 
 # from data_utils import * # bad - bandaid solution for a circular import 
 from utils.gen_utils import convert_to_list
@@ -36,7 +37,9 @@ def main(llms,
          save_path=None,
          plot_results=False,
          plot_confidence_band=False,
-         plot_gt_calibration=False):
+         plot_gt_calibration=False,
+         hide_non_summary=False,
+         save_seed_results=False):
     
     device = f'cuda:{gpu_id}'
     
@@ -45,11 +48,14 @@ def main(llms,
     sample_model, sample_dataset, sample_strategy = llms[0], datasets[0], sampling_strategies[0]
     T, C = data[sample_model][sample_dataset][sample_strategy]['test']['inputs'][0].shape
 
+    missing_seeds = []
+    validation_eces = []
+    
     comparison_results: List[ComparisonResult] = []
-
-    for seed in range(num_seeds):
-        if num_seeds>1:
-            print(f"Seed : {seed}")
+    
+    for seed in tqdm(range(num_seeds), desc='Evaluating checkpoints'):
+        # if num_seeds>1:
+        #     print(f"Seed : {seed}")
         
         model_dir = f"./calibration/models/"
         if llm_agnostic or len(llms)>1: 
@@ -57,16 +63,29 @@ def main(llms,
         else:
             model_dir += llms[0].replace('/','_')
             
-        # if len(sampling_strategies)==1:
-        #     model_dir += f"/{sampling_strategies[0]}"
         if ablation_method:
             model_dir += f"/ablations/{ablation_method}"
+        # if len(sampling_strategies)==1:
+        #     model_dir += f"/{sampling_strategies[0]}"
         if num_seeds>1:
             model_dir += f"/{seed}_seed"
             
-        
         model_path = f'{model_dir}/{model_name}'  
+        if not os.path.exists(model_path):
+            missing_seeds.append(seed)
+            continue
         
+        metrics_path = f"{model_dir}/metrics.json"
+        if not os.path.exists(metrics_path):
+            missing_seeds.append(seed)
+            continue
+        
+        with open(metrics_path, "r") as file:
+            metrics = json.load(file)
+            seed_val_ece = metrics['best_eval_calibrated_ece']
+            
+            validation_eces.append({"seed":seed, "ece":seed_val_ece})
+                    
         with open(f"calibration/models/transformer_config.json", 'r') as file:
             config = json.load(file)
             
@@ -76,13 +95,14 @@ def main(llms,
             embedding_dim=config['embedding_dim'], 
             num_heads=config['num_heads'], 
             num_layers=config['num_layers'],
-            dropout=config['dropout'],
+            dropout=0,
             pos_embedding_type=PositionEmbeddingType.SINUSOIDAL,
             output_type=calibrator_output_type,
         ).to(device)
         
-        print(calibrator)
-        print(f"{sum(p.numel() for p in calibrator.parameters())/10**6: .2f} M parameters")
+        # if seed==0:
+        #     print(calibrator)
+        #     print(f"{sum(p.numel() for p in calibrator.parameters())/10**6: .2f} M parameters")
         
         state_dict = torch.load(model_path, weights_only=True)
         cleaned_state_dict = {}
@@ -97,15 +117,30 @@ def main(llms,
         comparison_result = eval(calibrator, calibrator_output_type,
                                 data, llms, datasets, feature_type, shots_start, llm_agnostic,
                                 model_name, save_path=save_path,
-                                plot_results=plot_results, plot_confidence_band=plot_confidence_band, plot_gt_calibration=plot_gt_calibration)
+                                plot_results=plot_results, plot_confidence_band=plot_confidence_band, plot_gt_calibration=plot_gt_calibration, show_summary=not hide_non_summary)
         
         comparison_results.append(comparison_result)
 
     # print(f"ECEs: {[comparison_result.calibrated.ece for comparison_result in comparison_results]}")
     # print(f"Briers: {[comparison_result.calibrated.brier for comparison_result in comparison_results]}\n")
     
+    anomaly_seeds = []
+    anomaly_idxs = []
+    
+    mean_val_ece = np.mean([validation_ece ['ece'] for validation_ece in validation_eces])
+    for idx, seed_val in enumerate(validation_eces):
+        seed, seed_val_ece = seed_val['seed'], seed_val['ece']
+        if (seed_val_ece - mean_val_ece)/mean_val_ece >0.5:
+            anomaly_seeds.append(seed)
+            anomaly_idxs.append(idx)
+    if anomaly_seeds:
+        print(f"Anomaly seeds ({len(anomaly_seeds)} total): ", anomaly_seeds)
+    if missing_seeds:
+        print(f"Missing seeds ({len(missing_seeds)} total): ", missing_seeds)
+        
+    comparison_results = [comparison_result for idx, comparison_result in enumerate(comparison_results) if idx not in anomaly_idxs]
     comparison_result_overall = np.mean(comparison_results)
-    print("Comparison Summary:\n")
+    print("\nComparison Summary:\n")
     print(f"{'Method':<20} {'ECE':<10} {'Brier':<10}")
     print("-" * 40)
     print(f"{'Uncalibrated':<20} {comparison_result_overall.uncalibrated.ece:<10.4f} {comparison_result_overall.uncalibrated.brier:<10.4f}")
@@ -115,8 +150,15 @@ def main(llms,
     eval_dir = Path(model_dir)
     if num_seeds>1:
         eval_dir = eval_dir.parent
-        
-    eval_metrics = {
+    eval_path = eval_dir / "eval.json"
+    
+    eval_metrics = {}
+    if eval_path.exists():
+        with open(eval_path, "r") as file:
+            eval_metrics = json.load(file)
+
+    llms_key = " | ".join(llms)
+    eval_metrics[llms_key] = {
         "uncalibrated": {
             "ece": round(comparison_result_overall.uncalibrated.ece, 4),
             "brier": round(comparison_result_overall.uncalibrated.brier, 4)
@@ -131,7 +173,13 @@ def main(llms,
         }
     }
 
-    with open(eval_dir / "eval.json", "w") as file:
+    if save_seed_results:
+        eval_metrics[llms_key]['seedwise'] = {
+            "eces": [comparison_result.calibrated.ece for comparison_result in comparison_results],
+            "briers": [comparison_result.calibrated.brier for comparison_result in comparison_results]
+        }
+        
+    with open(eval_path, "w") as file:
         json.dump(eval_metrics, file, indent=2)
      
 def eval(calibrator, 
@@ -146,7 +194,8 @@ def eval(calibrator,
          save_path=None,
          plot_results=False,
          plot_confidence_band=False,
-         plot_gt_calibration=False):
+         plot_gt_calibration=False,
+         show_summary=False):
     
     llm_eval_summaries = []
     
@@ -169,7 +218,7 @@ def eval(calibrator,
             for sampling_strategy in data[llm][dataset]:
 
                 calibration_data = eval_llm_dataset(calibrator, calibrator_output_type, data, llm, dataset, sampling_strategy, shots_start, 
-                                        plot_results, plot_confidence_band, plot_gt_calibration)
+                                        plot_results, plot_confidence_band, plot_gt_calibration, verbose=show_summary)
                 
                 sampling_eces.append(calibration_data.overall_ece['calibrated'])
                 sampling_briers.append(calibration_data.overall_brier['calibrated'])
@@ -213,20 +262,8 @@ def eval(calibrator,
         llm_eval_summaries.append(get_stats_summary("Brier Score", dataset_static_briers))
         llm_eval_summaries.append("\n\n")
     
-    eval_summary = "".join(llm_eval_summaries)
-    print(eval_summary)
-    print("\n" + "="*60)
-    print(f"\n {model_name} OVERALL SUMMARY\n")
-    print("="*60)
-    print("\n--- Transformer Calibrator ---")
-    print(get_stats_summary("Expected Calibration Error (ECE)", llm_eces))
-    print(get_stats_summary("Brier Score", llm_briers))
-    print("\n--- Dynamic Temperature Scaling ---")
-    print(get_stats_summary("Expected Calibration Error (ECE)", llm_dynamic_eces))
-    print(get_stats_summary("Brier Score", llm_dynamic_briers))
-    print("\n--- Static Temperature Scaling ---")
-    print(get_stats_summary("Expected Calibration Error (ECE)", llm_static_eces))
-    print(get_stats_summary("Brier Score", llm_static_briers))
+    if show_summary:
+        print_llm_summary(model_name, llm_eval_summaries, llm_eces, llm_briers, llm_dynamic_eces, llm_dynamic_briers, llm_static_eces, llm_static_briers)
     
     comparison_result = ComparisonResult(
         uncalibrated=CalibrationMethodResult(
@@ -245,7 +282,11 @@ def eval(calibrator,
     
     return comparison_result
             
-def eval_llm_dataset(model, calibrator_output_type, data, llm, dataset, sampling_strategy, shots_start, plot_results, plot_confidence_band, plot_gt_calibration):
+def eval_llm_dataset(
+    model, calibrator_output_type, 
+    data, llm, dataset, sampling_strategy, shots_start, 
+    plot_results, plot_confidence_band, plot_gt_calibration,
+    verbose=False):
     calibration_data = CalibrationPlotData()
 
     inputs, logits, labels = get_batch(data[llm][dataset][sampling_strategy]['test']) # len(eval),T,C | len(eval),T,num_classes | len(eval),T
@@ -265,11 +306,11 @@ def eval_llm_dataset(model, calibrator_output_type, data, llm, dataset, sampling
     global_temp_metrics = {} if plot_gt_calibration else None
 
     model.eval()
-    with torch.no_grad():                        
+    with torch.inference_mode():                        
         outputs = model(inputs) # B,T,1
         
         calibrated_logits, loss = get_calibrated_logits_loss(logits, outputs, calibrator_output_type, labels, shots_start, num_iters=100)
-        temperatures = calibrated_logits/logits #if calibrator_output_type is CalibratorOutputType.CALIBRATED_PROBABILITY else outputs
+        temperatures = calibrated_logits/logits 
         
         probs, preds = F.softmax(logits, dim=-1).max(dim=-1)
         calibrated_probs, calibrated_preds = F.softmax(calibrated_logits, dim=-1).max(dim=-1)
@@ -279,7 +320,9 @@ def eval_llm_dataset(model, calibrator_output_type, data, llm, dataset, sampling
         
         # print(calibrated_probs[:, -1].mean().item(), calibrated_probs[:, -1].min().item(), calibrated_probs[:, -1].max().item(), calibrated_probs[:, -1].std().item())
         
-        print(f"|------Dataset: {dataset}------| [{sampling_strategy}]")
+        if verbose:
+            print(f"|------Dataset: {dataset}------| [{sampling_strategy}]")
+        
         for shot in range(shots_start, T):
             calibrator_metrics[shot] = CalibrationMetrics(logits[:, [shot], :], calibrated_logits[:, [shot], :], labels[:, [shot]], 
                                    shots_start=0, prepare_rel_diag=plot_results, plot_confidence_band=plot_confidence_band)
@@ -320,7 +363,8 @@ def eval_llm_dataset(model, calibrator_output_type, data, llm, dataset, sampling
                 shot_summary += f"\
     mean GT calibrated prob {calibration_data.conf_shots_map['global_temp_calibrated'][shot]:.4f}"
         
-            # print(shot_summary)
+        # if verbose:
+        #     print(shot_summary)
         
         num_shots = T - shots_start
         
@@ -365,6 +409,28 @@ def get_stats_summary(message, metrics):
     
     return summary
 
+def print_llm_summary(
+    model_name, llm_eval_summaries, 
+    llm_eces, llm_briers, 
+    llm_dynamic_eces, llm_dynamic_briers,
+    llm_static_eces, llm_static_briers
+    ):
+    
+    eval_summary = "".join(llm_eval_summaries)
+    print(eval_summary)
+    print("\n" + "="*60)
+    print(f"\n {model_name} OVERALL SUMMARY\n")
+    print("="*60)
+    print("\n--- Transformer Calibrator ---")
+    print(get_stats_summary("Expected Calibration Error (ECE)", llm_eces))
+    print(get_stats_summary("Brier Score", llm_briers))
+    print("\n--- Dynamic Temperature Scaling ---")
+    print(get_stats_summary("Expected Calibration Error (ECE)", llm_dynamic_eces))
+    print(get_stats_summary("Brier Score", llm_dynamic_briers))
+    print("\n--- Static Temperature Scaling ---")
+    print(get_stats_summary("Expected Calibration Error (ECE)", llm_static_eces))
+    print(get_stats_summary("Brier Score", llm_static_briers))
+    
 def args_check(args):
     if args['plot_confidence_band'] is True:
         assert args['plot_results'] is True, "Turn on plotting of results, you have plot_confidence_band as True"
@@ -372,26 +438,28 @@ def args_check(args):
 if __name__ == '__main__':
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('--llms', dest='llms', action='store', required=True, help='name of llms to evaluate the calibrator on')
-    parser.add_argument('--datasets', dest='datasets', action='store', required=True, help='name of datasets to eval the calibrator on')    
-    parser.add_argument('--feature_type', dest='feature_type', action='store', required=False, default="", help='the type of input features that make up the dataset')
-    parser.add_argument('--shots_start', dest='shots_start', action='store', required=False, type=int, default=8, help='which shot # onwards we will do calibration eval')
-    parser.add_argument('--shots_end', dest='shots_end', action='store', required=False, type=int, default=None, help='Till which shot # we will do calibration eval')
+    parser.add_argument('--llms', action='store', required=True, help='name of llms to evaluate the calibrator on')
+    parser.add_argument('--datasets', action='store', required=True, help='name of datasets to eval the calibrator on')    
+    parser.add_argument('--feature_type', action='store', required=False, default="", help='the type of input features that make up the dataset')
+    parser.add_argument('--shots_start', action='store', required=False, type=int, default=8, help='which shot # onwards we will do calibration eval')
+    parser.add_argument('--shots_end', action='store', required=False, type=int, default=None, help='Till which shot # we will do calibration eval')
     parser.add_argument('--sampling_strategies', action='store', required=False, default=None, help='what sampling strategy data to select(entropy vs similarity) (default: None - means select all)')
     
-    parser.add_argument('--calibrator_output_type', action='store', required=False, default="calibrated_probability", help='What the transformer calibrator outputs(temperature/calibrated probability)')
+    parser.add_argument('--calibrator_output_type', action='store', required=False, default="calibrated_probability", help='What the transformer calibrator outputs(temperature/calibrated_probability)')
     parser.add_argument('--ablation_method', action='store', required=False, default=None, help='Ablation method name, if performing ablation')
     parser.add_argument('--num_seeds', action='store', required=False, default=1, type=int, help='Number of seeds to train calibrators for')
     
-    parser.add_argument('--model_name', dest='model_name', action='store', required=False, default="calibrator", help='custom name for the model(calibrator), used for saving the checkpoints')    
-    parser.add_argument('--model_path', dest='model_path', action='store', default=None, required=False, help='Path of the model to be loaded ')
-    parser.add_argument('--llm_agnostic', dest='llm_agnostic', action='store_const', const=True, default=False, help='whether to use the llm agnostic calibrator')
-    parser.add_argument('--save_path', dest='save_path', action='store', default=None, required=False, help='What path to save the calibration plot to ')
-    parser.add_argument('--gpu_id', dest='gpu_id', action='store', default=0, required=False, help='Which CUDA gpu to run model on', type=int)
+    parser.add_argument('--model_name', action='store', required=False, default="calibrator", help='custom name for the model(calibrator), used for saving the checkpoints')    
+    parser.add_argument('--model_path', action='store', default=None, required=False, help='Path of the model to be loaded ')
+    parser.add_argument('--llm_agnostic', action='store_true', help='whether to use the llm agnostic calibrator')
+    parser.add_argument('--save_path', action='store', default=None, required=False, help='What path to save the calibration plot to ')
+    parser.add_argument('--gpu_id', action='store', default=0, required=False, help='Which CUDA gpu to run model on', type=int)
     
-    parser.add_argument('--plot_results', dest='plot_results', action='store_const', const=True, default=False, required=False, help='Whether to plot the results or just get eval metrics')
-    parser.add_argument('--plot_confidence_band', dest='plot_confidence_band', action='store_const', const=True, default=False, required=False, help='Whether to plot the confidence bands for the reliability plots')
-    parser.add_argument('--plot_gt_calibration', dest='plot_gt_calibration', action='store_const', const=True, default=False, required=False, help='Whether to plot the confidence bands for the reliability plots')
+    parser.add_argument('--plot_results', action='store_true', help='Whether to plot the results or just get eval metrics')
+    parser.add_argument('--plot_confidence_band', action='store_true', help='Whether to plot the confidence bands for the reliability plots')
+    parser.add_argument('--plot_gt_calibration', action='store_true', help='Whether to plot the confidence bands for the reliability plots')
+    parser.add_argument('--hide_non_summary', action='store_true', help='Whether to not to print the intermediate metric results before the final summary')
+    parser.add_argument('--save_seed_results', action='store_true', help='Whether to not to save the seedwise results in the eval.json')
     
     args = parser.parse_args()
     args = vars(args)

@@ -6,15 +6,21 @@ from tqdm import tqdm
 
 import torch
 import torch.nn.functional as F
+from utils.sampling_utils import get_similarities 
+
+CLASS_EMBED = None
+with open("calibration/models/transformer_config.json", "r") as file:
+    config = msgspec.json.decode(file.read())
+    MAX_NUM_CLASSES = config['context_length'] 
 
 def fix_seed(seed):
     random.seed(seed)
     np.random.seed(seed)
-
+    
     torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed(seed)
-        torch.cuda.manual_seed_all(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
         
 def get_batch(data: Dict, batch_size: Optional[int] = None):
     N = data["inputs"].shape[0] # dataset size
@@ -43,6 +49,7 @@ def load_datasets(
         task='correctness_pred',
         temp_augment: bool = False,
         label_augment: bool = False,
+        volume_fraction: float = 1,
         purpose: str = "calibrator training/eval",
     ):
     """Preload all datasets into GPU memory for fast training (with optional feature recalculation)."""
@@ -75,7 +82,9 @@ def load_datasets(
                     filtered_split_data = []
                     
                     # convert each sample into tensors and recalc features
-                    for idx in range(len(sampling_split_data)):
+                    data_size = int(len(sampling_split_data)*volume_fraction)
+                    data_idxs = torch.randperm(len(sampling_split_data))[:data_size]
+                    for idx in data_idxs:
                         shots_end = shots_end or len(sampling_split_data[idx]["inputs"])
                         sampling_split_data[idx]["inputs"] = torch.tensor(sampling_split_data[idx]["inputs"], dtype=torch.float32, device=device)[:shots_end+1, :]
                         sampling_split_data[idx]["logits"] = torch.tensor(sampling_split_data[idx]["logits"], dtype=torch.float32, device=device)[:shots_end+1, :]
@@ -86,23 +95,52 @@ def load_datasets(
                         if torch.isnan(sampling_split_data[idx]["logits"]).any():
                             has_nan_count += 1
                         else:
+                            # Probabilistic augmentation: clone original and add as extra sample
+                            # Only one augmentation active per clone even if both flags are true
+                            augmentation = random.choices(
+                                ['temp', 'label', None], 
+                                [0.5 if temp_augment else 0, 0.3 if label_augment else 0 , 1 - 0.5*temp_augment - 0.3*label_augment], 
+                                k=1
+                            )[0]
+                             
+                            apply_temp = augmentation=='temp'
+                            apply_label = augmentation=='label'
+                            
+                            if augmentation:
+                                aug_item = {k: v.clone() if isinstance(v, torch.Tensor) else v
+                                            for k, v in sampling_split_data[idx].items()}
                             
                             if task=='correctness_pred':
                                 recalculate_features(sampling_split_data[idx], 
-                                                    temp_augment=temp_augment, 
-                                                    label_augment=label_augment)
+                                                    temp_augment=False, 
+                                                    label_augment=False)
                             elif task=='bias_pred':
                                 recalculate_surprise_features(sampling_split_data[idx], 
-                                                            temp_augment=temp_augment, 
-                                                            label_augment=label_augment)
+                                                            temp_augment=False, 
+                                                            label_augment=False)
                             else:
                                 raise NotImplementedError(f"Task specification for recalculating features not reccognised: {task}")
-                        
-                        if sampling_split_data[idx].get('corrupt', False):
-                            corrupt_count += 1
-                        else:
-                            filtered_split_data.append(sampling_split_data[idx])
-
+                                    
+                            if sampling_split_data[idx].get('corrupt', False):
+                                corrupt_count += 1
+                            else:
+                                filtered_split_data.append(sampling_split_data[idx])
+                                
+                            if augmentation:
+                                if task=='correctness_pred':
+                                    recalculate_features(aug_item,
+                                                        temp_augment=apply_temp,
+                                                        label_augment=apply_label)
+                                elif task=='bias_pred':
+                                    recalculate_surprise_features(aug_item,
+                                                                temp_augment=apply_temp,
+                                                                label_augment=apply_label)
+                                
+                                if aug_item.get('corrupt', False):
+                                    corrupt_count += 1
+                                else:
+                                    filtered_split_data.append(aug_item)
+                                
                     nan_percentage = (has_nan_count / total_items * 100) if total_items > 0 else 0
                     corrupt_percentage = (corrupt_count / total_items * 100) if total_items > 0 else 0
                     if nan_percentage>0:
@@ -134,17 +172,25 @@ def reshuffle_embeddings(data: Dict):
                     embedding_dim = inputs.shape[-1] - 5
                     idxs = torch.randperm(embedding_dim, device=inputs.device)
                     inputs[:, :, -embedding_dim:] = inputs[:, :, -embedding_dim:][..., idxs]
-                    
+
+def create_class_embeddings(num_classes: int, device: str) -> torch.Tensor:
+    A = torch.randn(num_classes, num_classes, device=device)
+    Q, R = torch.linalg.qr(A)
+    # Sign correction for Haar uniformity
+    signs = torch.sign(torch.diag(R))
+    Q = Q * signs.unsqueeze(0)
+    return Q  
+
 def recalculate_features(item: Dict, temp_augment=False, label_augment=False):
     device = item['inputs'].device
-    # print(item['inputs'])
-
+    # print(item['inputs'][:5,:3])
     if temp_augment:
+        # print("temp augment"); exit()
         apply_temp_augmentation(item)    
         
     T, num_classes = item['logits'].shape
     probs = F.softmax(item['logits'], dim=-1)
-        
+    # print(probs[4])        
     pred_probs = probs.max(dim=-1).values
 
     item['inputs'][:,0] = pred_probs    
@@ -155,14 +201,7 @@ def recalculate_features(item: Dict, temp_augment=False, label_augment=False):
         apply_label_augmentation(item)  
         item['inputs'][1:, 1] = (item['logits'][:-1].argmax(dim = -1) == item['labels'][:-1]).float()
 
-    if temp_augment or label_augment:  
-        # shifted_gt_probs = torch.concatenate(
-        #     (
-        #         torch.tensor([0.5], device=device), 
-        #         probs[torch.arange(T-1), item['labels'][:-1]]
-        #     )
-        # ) # exclude last position and shift
-        
+    if temp_augment or label_augment:          
         item['inputs'][1:,2] = probs[torch.arange(T-1), item['labels'][:-1]]
     
     gt_prob_mses = torch.cat(
@@ -171,93 +210,95 @@ def recalculate_features(item: Dict, temp_augment=False, label_augment=False):
             (1 - item['inputs'][1:,[2]])**2
         ), 
         dim=0)
-    # gt_prob_mses = torch.zeros((T,1), device=device)
-    # gt_prob_mses[0,0] = 0.5
-    # gt_prob_mses[1:,[0]] = (1 - item['inputs'][1:,[2]])**2
-    knn = False
-    permute_embeddings = False
+
+    is_entropy = torch.tensor([
+            [float(item['sampling_strategy']=='ENTROPY')]
+            for _ in range(len(probs))
+            ], device=device
+        )
+
+    permute_embeddings = True
     if permute_embeddings:
-        embedding: torch.Tensor = item['inputs'][:, 46:]
+        embedding: torch.Tensor = item['inputs'][:, -128:]
+
+        embedding_match = (item['inputs'][:, -128:]==item['inputs'][:, 46:]).float().mean()
+        assert embedding_match == 1, f"{embedding_match} fraction of embeddings match the expected position"
+        
         # embedding = embedding/embedding.norm(dim=-1, keepdim=True)
         
         # idxs = torch.randperm(128, device=item["inputs"].device)
         # permuted_embeddings = embedding[:, idxs]
         permuted_embeddings = embedding
-        # embeddings = embedding - embedding.mean(dim=0)
-        # norms = embeddings.norm(dim=-1, keepdim=True)
-
-        # low_norm_mask = norms.squeeze(-1) < 1e-2
-        # if low_norm_mask.any():
-        #     item['corrupt'] = True
-        #     # print("Corrupt item")
-        #     return
-        #     # print(f"Low norm embeddings found: {low_norm_mask.sum().item()} / {len(norms)}")
-        #     # print(f"Norms: {norms[low_norm_mask].squeeze()}")
-        #     # print(f"Embeddings:\n{embeddings[low_norm_mask]}")
-        #     # print(f"Original embeddings:\n{embedding[low_norm_mask]}")
-        #     # print(f"probabilities: \n{pred_probs}")
-        #     # print(f"Correctness labels: \n{item['inputs'][:, 1]}")
-        #     # print(f"Labels: \n{item['labels']}")
-        # assert torch.min(norms)>0.01
         
-        item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, permuted_embeddings), dim=-1)
-        # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], permuted_embeddings), dim=-1)
-    elif knn == True:
-        input_sims  = item['inputs'][:, 4 + T : 4 + 2 * T]  # (T, T) causal
-        correctness = item['inputs'][:, 1]                    # correctness[j+1] = was pred_j correct?
-
-        knn_confidence     = torch.zeros(T, 1, device=device)
-        knn_sim_to_nearest = torch.zeros(T, 1, device=device)
-        sim_temperature    = 1
-
-        for t in range(T):
-            if t == 0:
-                knn_confidence[t, 0]     = 0.5
-                knn_sim_to_nearest[t, 0] = 0.0
-                continue
-
-            similarities                  = input_sims[t, :t]       # all t neighbours
-            neighbour_correctness = correctness[1 : t + 1]  # correctness[j+1] = was pred_j correct?
-
-            weights = F.softmax(similarities / sim_temperature, dim=0)
-            knn_confidence[t, 0]     = (weights * neighbour_correctness).sum()
-            knn_sim_to_nearest[t, 0] = similarities.max()
-
-        item['inputs'] = torch.cat(
-            (gt_prob_mses, item['inputs'][:, :3], second_highest_probs, knn_confidence, knn_sim_to_nearest),
-            dim=-1
-        )  # → (T, 7)
+        # class_embeddings = get_class_embeddings(item)
+        
+        item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, permuted_embeddings), dim=-1) # main/norm_embed
+        # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, is_entropy, class_embeddings), dim=-1) # class_embed
+        # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, is_entropy, class_embeddings, permuted_embeddings), dim=-1) # full embed
+        # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, class_embeddings, permuted_embeddings), dim=-1) # full embed for similarity sampling
+        # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, is_entropy, class_embeddings), dim=-1)
+        # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, class_embeddings), dim=-1)
+        pass
     else:
-        # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs), dim=-1)
-        is_entropy = torch.tensor([
-            [float(item['sampling_strategy']=='ENTROPY')]
-            for _ in range(len(probs))
-            ], device=device
-        )
-        item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, is_entropy), dim=-1)
-        # embedding: torch.Tensor = item['inputs'][:, -128:]
-        # norms = embedding.norm(dim=-1, keepdim=True)
-        # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, item['inputs'][:, 25:46]), dim=-1)
-
-        # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3]), dim=-1)
+        # similarities = item['inputs'][:, 25:46].clone()
+        # print(len(item['inputs'][0])); exit()
+        # embeddings = item['inputs'][:, -128:].cpu().numpy()
+        # similarities = torch.tril(torch.tensor(get_similarities(embeddings, embeddings)))
+        # # print(embeddings[:5]) ; exit()
+        # self_mask = torch.eye(MAX_NUM_CLASSES, dtype=torch.bool)[:len(similarities),:]
+        # similarities[self_mask]=0
+        # max_similarities = torch.max(similarities, dim=-1, keepdim=True).values
+        # print(max_similarities[:10])
+        
+        # similarities = item['inputs'][:, 25:46].clone()
+        # self_mask = torch.eye(MAX_NUM_CLASSES, dtype=torch.bool)[:len(similarities),:]
+        # similarities[self_mask]=0
+        # max_similarities = torch.max(similarities, dim=-1, keepdim=True).values
+        # print(max_similarities[:10]); exit()
+        # breakpoint()
+        # print(item['inputs'][:5,:50], max_similarities, item['sampling_strategy']); exit()
+        item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs), dim=-1)
+        # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, similarities), dim=-1)
+        # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, is_entropy), dim=-1)
+        # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], second_highest_probs, max_similarities) , dim=-1)
         # item['inputs'] = item['inputs'][:,:2]
         
-    # print(item['inputs']); exit()
-    # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3], item['inputs'][:, 25:46]), dim=-1)
-    # item['inputs'] = torch.cat((gt_prob_mses, item['inputs'][:,:3]), dim=-1)
+    # print(item['inputs'].shape); exit()
     # correctness = (item['labels']==item['logits'].argmax(dim=-1)).float().view(T, 1).to(device) # leakage test
     # item['inputs'] = torch.cat((gt_prob_mses, correctness, item['inputs'][:,:3]), dim=-1) # leakage test
     # print(item['inputs']), item['inputs'][:,25:46]
-    # item['inputs'][:, 0] = torch.linspace(0.5, 1, len(item['inputs']))
-    # item['inputs'][:, 2] = 0
-    # print(item['inputs'][:,1])
-    # print(item['logits'].argmax(dim=-1).float())
-    # print(item['labels'].float()); exit()
     # print(item['inputs'][-10:,:25])
-    # print(item['inputs'][:10,:50], item['sampling_strategy'])
-    # exit()
-    # add_noise_to_features(item)
+    # print(item['inputs'][:5,:50], item['sampling_strategy'], temp_augment, label_augment)
  
+def get_class_embeddings(item: Dict):
+    global CLASS_EMBED
+    
+    if CLASS_EMBED is None or random.uniform(0,10)<2:
+        CLASS_EMBED = create_class_embeddings(num_classes=MAX_NUM_CLASSES, device=item['inputs'].device)
+        
+    preds = item['logits'].argmax(dim=-1).tolist()
+    sorted_preds = sorted(list(set(preds)))
+    num_unique_classes = len(sorted_preds)
+    
+    # shuffled_class_embeddings =  CLASS_EMBED[:num_unique_classes, :]
+    idxs = torch.randperm(MAX_NUM_CLASSES)[:num_unique_classes]
+    shuffled_class_embeddings =  CLASS_EMBED[idxs, :]
+    idxs = torch.randperm(MAX_NUM_CLASSES)
+    shuffled_class_embeddings =  shuffled_class_embeddings[:, idxs]
+    
+    # print(preds[:3], sorted_preds)
+    # print(shuffled_class_embeddings)
+    class_embedding_map = {
+        pred_class : shuffled_class_embeddings[i] for i, pred_class in enumerate(sorted_preds)
+    }
+
+    class_embeddings = torch.stack(
+        [class_embedding_map[pred_class] for pred_class in preds]
+    )
+    
+    return class_embeddings
+
+    
 def recalculate_surprise_features(item: Dict, temp_augment=False, label_augment=False, max_classes=100):
     device = item['inputs'].device
     T, num_classes = item['logits'].shape
@@ -319,17 +360,39 @@ def get_correctness_matching_temp(item):
             
     return temperature
     
-def apply_label_augmentation(item: Dict):
+# def apply_label_augmentation(item: Dict):
+#     mean_conf = item['inputs'][:, 0].mean()
+#     beta = 1 if mean_conf < 0.95 else 2
+#     max_temp = 1 + torch.clamp(torch.tanh(beta*(mean_conf - 0.5)), min=0, max=0.3)
+#     temp = random.uniform(1,max_temp)
+#     logits = item['logits'] / temp
+    
+#     probs = F.softmax(logits, dim=-1)
+#     preds = torch.multinomial(probs, 1).squeeze(-1)
+#     # print(mean_conf, max_temp, temp, probs.max(dim=-1).values.mean())#; exit()
+#     # print(item['labels'], '\n', logits.max(dim=-1).indices, '\n', preds); exit()
+    
+#     item['labels'] = preds
+
+def apply_label_augmentation(item: Dict) -> None:
     mean_conf = item['inputs'][:, 0].mean()
-    max_temp = 1 + torch.clamp(torch.tanh(4 * (mean_conf - 0.5)), min=0)
-    temp = random.uniform(1,max_temp)
+    simulate_calibrated = random.random() < mean_conf/2
+    
+    if simulate_calibrated:
+        beta = 1 if mean_conf < 0.95 else 2
+        max_temp = 1 + torch.clamp(torch.tanh(beta * (mean_conf - 0.5)), min=0, max=0.3)
+        temp = random.uniform(1, max_temp.item())
+    else:
+        beta = 1 if mean_conf < 0.95 else 2
+        max_temp = 2 + 3*torch.clamp(torch.tanh(beta * (mean_conf - 0.4)), min=0.5)
+        temp = random.uniform(2, max_temp.item())        
+        
     logits = item['logits'] / temp
     
     probs = F.softmax(logits, dim=-1)
     preds = torch.multinomial(probs, 1).squeeze(-1)
-    
     item['labels'] = preds
-        
+            
 def add_noise_to_features(item: Dict):
     device = item['inputs'].device
 
@@ -338,3 +401,22 @@ def add_noise_to_features(item: Dict):
     noise = torch.normal(mean=1, std=5, size=(perturbed_shots, C), device=device)
     
     item['inputs'][:perturbed_shots,:] += noise
+
+# def check_embeddings(embeddings: torch.Tensor):
+    # permuted_embeddings = embedding
+    # embeddings = embedding - embedding.mean(dim=0)
+    # norms = embeddings.norm(dim=-1, keepdim=True)
+
+    # low_norm_mask = norms.squeeze(-1) < 1e-2
+    # if low_norm_mask.any():
+    #     item['corrupt'] = True
+    #     # print("Corrupt item")
+    #     return
+    #     # print(f"Low norm embeddings found: {low_norm_mask.sum().item()} / {len(norms)}")
+    #     # print(f"Norms: {norms[low_norm_mask].squeeze()}")
+    #     # print(f"Embeddings:\n{embeddings[low_norm_mask]}")
+    #     # print(f"Original embeddings:\n{embedding[low_norm_mask]}")
+    #     # print(f"probabilities: \n{pred_probs}")
+    #     # print(f"Correctness labels: \n{item['inputs'][:, 1]}")
+    #     # print(f"Labels: \n{item['labels']}")
+    # assert torch.min(norms)>0.01

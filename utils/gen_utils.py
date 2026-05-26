@@ -12,7 +12,7 @@ import random
 from sampling_strategies import SamplingStrategy
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-SAVE_DIR = ROOT_DIR/"saved_results_rebuttal"
+SAVE_DIR = ROOT_DIR/"saved_results_emnlp"
 
 if not os.path.isdir(SAVE_DIR):
     os.mkdir(SAVE_DIR)
@@ -171,7 +171,7 @@ def setup_vllm_env_settings():
         torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.benchmark = False
     torch.backends.cudnn.deterministic = True
-    torch.use_deterministic_algorithms(True)  
+    # torch.use_deterministic_algorithms(True)  
     # inductor_config.benchmark_combo_kernel = False
     # inductor_config.fallback_random = True
     # inductor_config.coordinate_descent_tuning = False

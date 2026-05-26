@@ -4,10 +4,15 @@
 *.json
 *.pkl
 *.pt
-# *.png
+*.png
+*.csv
 **/calibrator*
+generate_calibration_dataset2.py
+explore.ipynb
 
 setup.sh
+sbatch.sh
+logs/
 results/
 saved_results/
 saved_results

@@ -99,6 +99,8 @@ def main(models, datasets, num_shots, train_size, test_size, append_data, api_nu
         train_split = IclDatasetSplit(*load_dataset_with_embeddings(dataset, 'train'))
         datasets_dict[dataset] = IclDataset(train=train_split, test=None)
 
+    # with
+
     generate_calibration_datasets(all_params, datasets_dict, calibration_datasets)
     time_taken = time()-start
     logger.info("Time taken to finish: %d hours, %d mins", time_taken//3600, (time_taken%3600)//60)
@@ -145,8 +147,8 @@ def generate_calibration_datasets(params_list: List[Dict], datasets: Dict, calib
             for iter in tqdm(range(params[f'{split}_size']), desc=f'Generating {split} split'):
                 sampling_strategy = random.choices(
                     [SamplingStrategy.ENTROPY, SamplingStrategy.SIMILARITY],
-                    [0.5, 0.5],
-                    # [0, 1],
+                    # [0.5, 0.5],
+                    [0, 1],
                     # [1, 0],
                     k=1
                     )[0]
@@ -154,47 +156,143 @@ def generate_calibration_datasets(params_list: List[Dict], datasets: Dict, calib
                     selected_sentences, selected_labels, selected_idxs = random_sampling(all_sentences, all_labels, num_shots+1, EntropyLevels.RANDOM) 
                     
                     selected_embeddings = np.array([all_embeddings[idx] for idx in selected_idxs])
-                    data = data_generation_fn(params, selected_sentences, selected_embeddings, selected_labels)
+                    # data = data_generation_fn(params, selected_sentences, selected_embeddings, selected_labels)
                 
                 elif sampling_strategy==SamplingStrategy.SIMILARITY:
                     selected_sentences, selected_labels, selected_idxs = random_sampling(all_sentences, all_labels, 1, EntropyLevels.RANDOM) 
                     
-                    shuffle_examples = random.random() < 0.5 # Keep in-context examples sorted by similarity 50% of the time
-                    # shuffle_examples = random.random() < 0 # Keep in-context examples sorted by similarity 50% of the time
+                    # shuffle_examples = random.random() < 0.5 # Keep in-context examples sorted by similarity 50% of the time
+                    shuffle_examples = random.random() < 0 # Keep in-context examples sorted by similarity 50% of the time
                     selected_embeddings = np.array([all_embeddings[idx] for idx in selected_idxs]) # only 1 idx here
                     sampled_data = similarity_sampling(all_sentences, all_embeddings, all_labels, 
                                                        test_embeddings=selected_embeddings, num_shots=num_shots+1, shuffle=shuffle_examples, return_embeddings=True)
                     # print(sampled_data.sentences, selected_sentences[0])
                     # exit()
-                    # print(sampled_data.embeddings.shape, all_embeddings.shape)
+                    # print(sampled_data.embeddings.shape, selected_embeddings.shape, all_embeddings.shape)
                     # exit()
-                    data = data_generation_fn(params, sampled_data.sentences[0], sampled_data.embeddings[0], sampled_data.labels[0])
-                data['sampling_strategy'] = sampling_strategy.name
+                    # print(sampled_data.sentences, '\n', selected_sentences)#; exit()
+                    # print('\n', sampled_data.sentences[0][-1], '\n', selected_sentences[0]); exit()
+                    assert (sampled_data.embeddings[0][-1] == selected_embeddings).mean()==1,f"{sampled_data.embeddings[0][-1]}, {selected_embeddings}" 
+                    data = np.tril(get_similarities(sampled_data.embeddings[0], sampled_data.embeddings[0])) # only lower triangular to make it causal
+                    # print(data); exit() 
+                # data['sampling_strategy'] = sampling_strategy.name
                 calibration_datasets[params['generated_dataset_name']][split].append(data)
             
-            validate_accuracy(num_shots, calibration_datasets[params['generated_dataset_name']][split])
+        save_avg_similarities(num_shots, params['dataset'], calibration_datasets[params['generated_dataset_name']]['train'])
+        # save_min_similarities(num_shots, params['dataset'], calibration_datasets[params['generated_dataset_name']]['test'])
             
         logger.info("Time taken to create %s dataset: %d sec", params['generated_dataset_name'], round(time()-start))        
-        save_dataset(params, calibration_datasets[params['generated_dataset_name']])
+        # save_dataset(params, calibration_datasets[params['generated_dataset_name']])
 
-def validate_accuracy(num_shots, data: List):
+def save_max_similarities(num_shots, dataset: str, data: List):
     if len(data)==0:
         return
     
-    for sampling_strategy in (SamplingStrategy.ENTROPY.name, SamplingStrategy.SIMILARITY.name):    
-        predictions = np.array([np.array(item['logits']).argmax(axis=-1) for item in data if item['sampling_strategy']==sampling_strategy])
-        labels = np.array([item['labels'] for item in data if item['sampling_strategy']==sampling_strategy])
-      
-        accuracy = {shot:None for shot in range(num_shots+1)}
+    for sampling_strategy in (SamplingStrategy.SIMILARITY.name, ):    
+        similarities = torch.tensor(data)
+        self_mask = torch.eye(num_shots+1, dtype=torch.bool)#.unsqueeze(0)
+        similarities[:, self_mask]=0
+        max_similarities = torch.max(similarities, dim=-1).values
+        # print(max_similarities)
+        shotwise_max_sim = {shot:None for shot in range(num_shots+1)}
         for shot in range(num_shots+1):
-            accuracy[shot] = round(float(np.mean(predictions[:, shot]==labels[:, shot])), 4)
+            shotwise_max_sim[shot] = round(float(torch.mean(max_similarities[:, shot])), 4)
             
-        if max(accuracy.values()) - min(accuracy.values()) > 0.1:
-            print("Possibly buggy variation in shotwise accuracy")
         
-        print(f"Shotwise accuracy for {sampling_strategy}({len(predictions)} items):")
-        pprint(accuracy)
+        print(f"Shotwise max similarity for {sampling_strategy}:")
+        pprint(shotwise_max_sim)
+        
+        full_shotwise = {}
+        if os.path.exists("shotwise_max_sim.json"):
+            with open("shotwise_max_sim.json", "r") as file:
+                full_shotwise = json.load(file)
+        with open("shotwise_max_sim.json", "w") as file:
+            full_shotwise[dataset] = shotwise_max_sim
+            json.dump(full_shotwise, file, indent=2)
+               
+def save_min_similarities(num_shots, dataset: str, data: List):
+    if len(data)==0:
+        return
+    
+    for sampling_strategy in (SamplingStrategy.SIMILARITY.name, ):    
+        similarities = torch.tensor(data)
+        self_mask = torch.eye(num_shots+1, dtype=torch.bool)#.unsqueeze(0)
+        similarities[:, self_mask]=0
+        zero_mask = similarities==0
+        similarities[zero_mask] = torch.inf
+        min_similarities = torch.min(similarities, dim=-1).values
+        # print(min_similarities)
+        shotwise_min_sim = {shot:None for shot in range(num_shots+1)}
+        for shot in range(num_shots+1):
+            shotwise_min_sim[shot] = round(float(torch.mean(min_similarities[:, shot])), 4)
             
+        
+        print(f"Shotwise min similarity for {sampling_strategy}:")
+        pprint(shotwise_min_sim)
+        
+        full_shotwise = {}
+        if os.path.exists("shotwise_min_sim.json"):
+            with open("shotwise_min_sim.json", "r") as file:
+                full_shotwise = json.load(file)
+        with open("shotwise_min_sim.json", "w") as file:
+            full_shotwise[dataset] = shotwise_min_sim
+            json.dump(full_shotwise, file, indent=2)
+            
+def save_avg_similarities(num_shots, dataset: str, data: List):
+    if len(data)==0:
+        return
+    
+    for sampling_strategy in (SamplingStrategy.SIMILARITY.name, ):    
+        similarities = torch.tensor(data)
+        self_mask = torch.eye(num_shots+1, dtype=torch.bool)
+        similarities[:, self_mask]=0
+        non_zero_counts = (similarities != 0).sum(dim=-1).clamp(min=1)  # [N, num_shots+1]
+        mean_similarities = similarities.sum(dim=-1) / non_zero_counts
+        # print(mean_similarities)
+        shotwise_mean_sim = {shot:None for shot in range(num_shots+1)}
+        for shot in range(num_shots+1):
+            shotwise_mean_sim[shot] = round(float(torch.mean(mean_similarities[:, shot])), 4)
+            
+        
+        print(f"Shotwise mean similarity for {sampling_strategy}:")
+        pprint(mean_similarities)
+        
+        full_shotwise = {}
+        if os.path.exists("shotwise_mean_sim.json"):
+            with open("shotwise_mean_sim.json", "r") as file:
+                full_shotwise = json.load(file)
+        with open("shotwise_mean_sim.json", "w") as file:
+            full_shotwise[dataset] = shotwise_mean_sim
+            json.dump(full_shotwise, file, indent=2)
+            
+def save_median_similarities(num_shots, dataset: str, data: List):
+    if len(data)==0:
+        return
+    
+    for sampling_strategy in (SamplingStrategy.SIMILARITY.name, ):    
+        similarities = torch.tensor(data)
+        self_mask = torch.eye(num_shots+1, dtype=torch.bool)
+        similarities[:, self_mask]=0
+        non_zero_counts = (similarities != 0).sum(dim=-1).clamp(min=1)  # [N, num_shots+1]
+        median_similarities = similarities.sum(dim=-1) / non_zero_counts
+        # print(mean_similarities)
+        shotwise_median_sim = {shot:None for shot in range(num_shots+1)}
+        for shot in range(num_shots+1):
+            shotwise_median_sim[shot] = round(float(torch.mean(median_similarities[:, shot])), 4)
+            
+        
+        print(f"Shotwise median similarity for {sampling_strategy}:")
+        pprint(median_similarities)
+        
+        full_shotwise = {}
+        if os.path.exists("shotwise_median_sim.json"):
+            with open("shotwise_median_sim.json", "r") as file:
+                full_shotwise = json.load(file)
+        with open("shotwise_median_sim.json", "w") as file:
+            full_shotwise[dataset] = shotwise_median_sim
+            json.dump(full_shotwise, file, indent=2)
+            
+
 def args_check(args: Dict):
     pass
 

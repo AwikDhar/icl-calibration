@@ -2,7 +2,7 @@ import argparse
 from pathlib import Path
 import pandas as pd
 import numpy as np
-from plot_results.results_utils import cvt_to_sampling_type, get_saved_results, METHOD_NAME_MAP, ROOT_DIR, SAVE_DIR
+from plot_results.results_utils import PLOT_DIR, cvt_to_sampling_type, get_metric_display_name, get_saved_results, METHOD_NAME_MAP, ROOT_DIR, SAVE_DIR
 from calibration_methods import CalibrationMethods
 from utils.gen_utils import convert_to_list
 
@@ -28,7 +28,7 @@ def format_metric(metric_dict, show_std):
     mean = metric_dict['mean']
     std = metric_dict['std']
     
-    if mean > 1:  # Not brier loss. A percentage. 1 decimal precision (fix this heuristic)
+    if mean > 2:  # Not brier loss. A percentage. 1 decimal precision (fix this heuristic)
         return f"{mean:.1f} ± {std:.1f}" if show_std else  f"{mean:.1f}"
     
     return f"{mean:.3f} ± {std:.3f}" if show_std else f"{mean:.3f}"
@@ -41,12 +41,6 @@ def parse_metric(metric_str):
     mean = float(parts[0])
     std = float(parts[1]) if len(parts) > 1 else 0.0
     return mean, std
-
-def get_metric_display_name(metric):
-    if metric.lower() in ('brier', 'accuracy'):
-        return metric.upper()
-    
-    return metric.title()  
 
 def create_comparison_table(results, model, datasets, all_shots, sampling_strategies, 
                            calibration_methods, metrics, show_std):
@@ -225,7 +219,7 @@ def main(args):
     output_dir = ROOT_DIR / args.output_dir
     
     # Determine CSV filename
-    csv_filename = args.csv_name if args.csv_name else 'comparison.csv'
+    csv_filename = args.csv_name
     if not csv_filename.endswith('.csv'):
         csv_filename += '.csv'
     
@@ -251,8 +245,9 @@ def main(args):
         
         # Save to CSV with proper formatting
         save_path = save_dir / csv_filename
-        save_table_with_formatting(df, save_path)
-        print(f"Saved table to {save_path}")
+        if not args.no_save:
+            save_table_with_formatting(df, save_path)
+            print(f"Saved table to {save_path}")
         
         # Also print to console (simplified view)
         print("\n" + "="*80)
@@ -282,10 +277,12 @@ if __name__ == "__main__":
                        help='Whther to tabulate standard deviations along with means')
     parser.add_argument('--results_dir', type=str, default=None,
                        help='Directory containing saved results')
-    parser.add_argument('--output_dir', type=str, default='plot_results/comparisons_rebuttal/20_samples/tables',
+    parser.add_argument('--output_dir', type=str, default=PLOT_DIR/"tables",
                        help='Output directory for tables')
-    parser.add_argument('--csv_name', type=str, default=None,
+    parser.add_argument('--csv_name', type=str, default='comparison.csv',
                        help='Custom CSV filename (default: comparison.csv)')
+    parser.add_argument('--no_save', action='store_true',
+                       help='Do not save the comparison csv')
     
     args = parser.parse_args()
     
@@ -295,5 +292,6 @@ if __name__ == "__main__":
     args.sampling_strategies = convert_to_list(args.sampling_strategies)
     args.calibration_methods = convert_to_list(args.calibration_methods)
     args.metrics = convert_to_list(args.metrics)
+    args.csv_name = args.csv_name if len(args.metrics) > 1 else f"{'_'.join(args.metrics)}_comparison.csv"
     
     main(args)

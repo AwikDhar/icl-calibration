@@ -1,8 +1,0 @@
-,Calibration Methods,,,,,,,
-,Uncalibrated,,TS-AR,,TS-FS,,Calibformer,
-Datasets,Ece,BRIER,Ece,BRIER,Ece,BRIER,Ece,BRIER
-amazon_counterfactual,6.6,0.170,4.4,0.177,4.5,0.178,4.9,0.166
-commonsense_qa,9.1,0.234,6.8,0.245,6.6,0.242,4.7,0.226
-medqa,9.1,0.227,11.5,0.267,5.5,0.230,4.3,0.215
-when2call,13.9,0.344,6.5,0.322,6.3,0.322,4.7,0.308
-Average,9.7,0.244,7.3,0.253,5.7,0.243,4.7,0.229

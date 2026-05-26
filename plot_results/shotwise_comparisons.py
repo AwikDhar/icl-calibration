@@ -1,12 +1,11 @@
 import argparse
+import math
 from pathlib import Path
 import matplotlib.pyplot as plt
 import numpy as np
 import pandas as pd
 from calibration_methods import CalibrationMethods
-from plot_results.results_utils import get_saved_results, cvt_to_sampling_type, SAVE_DIR, ROOT_DIR, METHOD_NAME_MAP, METHOD_COLOUR_MAP
-
-PLOT_DIR = ROOT_DIR / "plot_results" / "comparisons"
+from plot_results.results_utils import get_metric_display_name, get_saved_results, cvt_to_sampling_type, SAVE_DIR, PLOT_DIR, METHOD_NAME_MAP, METHOD_COLOUR_MAP
 
 plt.rcParams.update({'font.size': 20})
 
@@ -51,12 +50,6 @@ def parse_metric(metric_str):
     mean = float(parts[0])
     std = float(parts[1]) if len(parts) > 1 else 0.0
     return mean, std
-
-def get_metric_display_name(metric):
-    """Convert metric key to display name."""
-    if metric.lower() in ('brier', 'accuracy'):
-        return metric.upper()
-    return metric.title()
 
 def average_across_datasets(
     results_dict,
@@ -133,7 +126,7 @@ def plot_dataset_averaged_comparison(
     )
     
     # Create figure
-    fig, ax = plt.subplots(figsize=(10, 6))
+    fig, ax = plt.subplots(figsize=(9, 6))    
     
     # Plot each calibration method
     for calibration_method in calibration_methods:
@@ -155,13 +148,9 @@ def plot_dataset_averaged_comparison(
                         alpha=0.2, color=color)
     
     # Formatting
-    ax.set_xlabel('Number of Shots', fontsize=14, fontweight='bold')
-    ax.set_ylabel(get_metric_display_name(metric), fontsize=14, fontweight='bold')
+    ax.set_xlabel('Number of Shots')
+    ax.set_ylabel(get_metric_display_name(metric))
     
-    dataset_list = ', '.join(datasets) if len(datasets) <= 3 else f"{len(datasets)} datasets"
-    # ax.set_title(f"{get_metric_display_name(metric)} (Averaged Across Datasets)\n{model} on {dataset_list} ({sampling_strategy.name})",
-    #              fontsize=14, fontweight='bold', pad=20)
-    ax.legend(loc='best', frameon=True, shadow=True, fontsize=11)
     ax.grid(True, alpha=0.3, linestyle='--')
     ax.set_xticks(all_shots)
     
@@ -169,7 +158,12 @@ def plot_dataset_averaged_comparison(
     bottom = 0 if metric in ['ece', 'mce'] else None
     ax.set_ylim(bottom=bottom)
     
+    handles, labels = ax.get_legend_handles_labels()
+    fig.legend(handles, labels, loc='lower center', ncol=math.ceil(len(calibration_methods)/2),
+            bbox_to_anchor=(0.5, -0.05), frameon=True, shadow=True)
+    
     plt.tight_layout()
+    plt.subplots_adjust(bottom=0.25)
     
     # Save plot
     model_name = model.replace('/', '_').replace('-FP8', '')

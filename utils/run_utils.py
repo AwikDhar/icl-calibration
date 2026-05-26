@@ -57,13 +57,14 @@ logging.getLogger('httpx').setLevel(logging.ERROR)
 logging.getLogger('httpcore').setLevel(logging.ERROR)
 
 llm_framework = LlmFramework.VLLM
-embedding_framework = LlmFramework.VLLM
+embedding_framework = LlmFramework.HF
 infer_model = None
 compile = False
 infer_tokenizer = None
 calibrator = None
 gpu_ids = None
 embedding_models = {}
+embedding_dim = 128
 
 def chunks(lst, n):
     """Yield successive n-sized chunks from lst."""
@@ -115,6 +116,50 @@ def calculate_utilization(model_name: str, num_gpus: int, buffer_factor: float =
     utilization = needed_per_gpu / total_vram_gb
     return min(utilization, 0.9)
 
+def setup_embedding_model(embedding_model_name: str):
+    global embedding_models
+    global gpu_ids
+    global embedding_framework
+    
+    if embedding_model_name not in embedding_models:
+        HF_HOME = os.environ.get('HF_HOME')     
+        cache_dir = os.environ.get('HF_HUB_CACHE', HF_HOME)
+
+        model_snapshot_or_card = get_model_snapshot_path(embedding_model_name, cache_dir)
+        
+        if embedding_framework is LlmFramework.HF:
+            attn_implementation = "kernels-community/flash-attn2" 
+            attn_implementation_path = get_model_snapshot_path(attn_implementation, cache_dir)
+            embedding_models[embedding_model_name] = SentenceTransformer(model_snapshot_or_card, device=f'cuda:0', truncate_dim=embedding_dim, cache_folder=cache_dir, 
+                                                                         model_kwargs={'dtype':torch.bfloat16})#, 'attn_implementation':'flash_attention_2'})
+        elif embedding_framework is LlmFramework.VLLM:
+            
+            # max_model_len = 20000 if 'qwen' in embedding_model_name.lower() else None
+            
+            embedding_models[embedding_model_name] = LLM(
+                model=model_snapshot_or_card,
+                runner="pooling",
+                max_model_len=None,
+                # attention_config=config.AttentionConfig(backend=backend),
+                tensor_parallel_size=1,
+                download_dir=cache_dir,
+                seed=42,
+                # enforce_eager=True,
+                gpu_memory_utilization=calculate_utilization(embedding_model_name, 1),
+                hf_overrides={"is_matryoshka": True},
+                trust_remote_code=True,
+            )
+                         
+def get_embedding_prompt(model_name: str, input_text: str, task_desc: str = "classification: "):
+    if "qwen" in model_name.lower():
+        # Qwen3 format: Instruct: {task}\nQuery:{query}
+        full_prompt = f"Instruct: {task_desc.title()}\nQuery: {input_text}"
+    else:
+        # Gemma format: task: {task} | query: {query}
+        full_prompt = f"task: {task_desc} | query: {input_text}"
+        
+    return full_prompt
+    
 # Get embeddings of sentences at a specified truncated dim. 
 # Full embeddings for similarity sampling, truncated embeddings for calibrator features for easier learning 
 def get_embeddings(params: Dict, sentences: List[str], embedding_model_name: str):
@@ -133,7 +178,7 @@ def get_embeddings(params: Dict, sentences: List[str], embedding_model_name: str
     elif embedding_framework is LlmFramework.VLLM:
         # sentences = [get_embedding_prompt(embedding_model_name, sentence) for sentence in sentences]
         embedding_model = embedding_models[embedding_model_name]
-        truncate_dim = params.get('embedding_dim', 128)
+        truncate_dim = params.get('embedding_dim', embedding_dim)
         pooling_params = PoolingParams(dimensions=truncate_dim)
             
         outputs = embedding_model.embed(sentences, pooling_params=pooling_params, truncate_prompt_tokens=-1, use_tqdm=False)
@@ -142,10 +187,11 @@ def get_embeddings(params: Dict, sentences: List[str], embedding_model_name: str
     return sentences_embeddings
 
 def get_hidden_feature_embeddings(hidden_features: List[np.ndarray]):
+    global embedding_dim
+
     if not isinstance(hidden_features, np.ndarray):
         hidden_features = np.array(hidden_features)
     
-    embedding_dim = 128
     hidden_dim = hidden_features.shape[1]
 
     # Zero-mean Gaussian scaled by 1/sqrt(hidden_dim) satisfies JL property, preserving cosine similarity
@@ -156,48 +202,6 @@ def get_hidden_feature_embeddings(hidden_features: List[np.ndarray]):
 
     return hidden_features
 
-def setup_embedding_model(embedding_model_name: str):
-    global embedding_models
-    global gpu_ids
-    global embedding_framework
-    
-    if embedding_model_name not in embedding_models:
-        HF_HOME = os.environ.get('HF_HOME')     
-        cache_dir = os.environ.get('HF_HUB_CACHE', HF_HOME)
-
-        model_snapshot_or_card = get_model_snapshot_path(embedding_model_name, cache_dir)
-        
-        if embedding_framework is LlmFramework.HF:
-            attn_implementation = "kernels-community/flash-attn2" 
-            embedding_models[embedding_model_name] = SentenceTransformer(model_snapshot_or_card, device=f'cuda:0', truncate_dim=128, cache_folder=cache_dir, 
-                                                                         model_kwargs={'dtype':torch.bfloat16, 'attn_implementation':attn_implementation})
-        elif embedding_framework is LlmFramework.VLLM:
-            
-            # max_model_len = 20000 if 'qwen' in embedding_model_name.lower() else None
-            
-            embedding_models[embedding_model_name] = LLM(
-                model=model_snapshot_or_card,
-                runner="pooling",
-                max_model_len=None,
-                # attention_config=config.AttentionConfig(backend=backend),
-                tensor_parallel_size=1,
-                download_dir=cache_dir,
-                seed=42,
-                gpu_memory_utilization=calculate_utilization(embedding_model_name, 1),
-                hf_overrides={"is_matryoshka": True},
-                trust_remote_code=True,
-            )
-                         
-def get_embedding_prompt(model_name: str, input_text: str, task_desc: str = "classification: "):
-    if "qwen" in model_name.lower():
-        # Qwen3 format: Instruct: {task}\nQuery:{query}
-        full_prompt = f"Instruct: {task_desc}\nQuery: {input_text}"
-    else:
-        # Gemma format: task: {task} | query: {query}
-        full_prompt = f"task: {task_desc} | query: {input_text}"
-        
-    return full_prompt
-    
 def setup_llm(model_name, gpu_ids_=[0]):
     global infer_model
     global gpu_ids
@@ -227,8 +231,8 @@ def setup_llm(model_name, gpu_ids_=[0]):
                     max_model_len=40000,
                     # quantization='fp8',
                     # attention_config=config.AttentionConfig(backend="TRITON_ATTN"),
-                    # attention_config=config.AttentionConfig(backend="FLASH_ATTN"),
-                    attention_config=config.AttentionConfig(backend="FLASHINFER"),
+                    attention_config=config.AttentionConfig(backend="FLASH_ATTN"),
+                    # attention_config=config.AttentionConfig(backend="FLASHINFER"),
                     kv_cache_dtype="auto",
                     seed=42,
                     # dtype='float16', # for deterministic results. bf16 has slight precision issues, which make matrix operations non-deterministic
@@ -236,7 +240,7 @@ def setup_llm(model_name, gpu_ids_=[0]):
                     max_num_batched_tokens=200_000, 
                     max_num_seqs=8,  
                     enable_prefix_caching=True,
-                    enforce_eager=True,
+                    # enforce_eager=True,
                     limit_mm_per_prompt={"image": 0, "video": 0}, # to skip any initialization/tuning for multimodal inputs
                     max_logprobs=-1,
                     download_dir=cache_dir,
@@ -394,7 +398,7 @@ def complete_generation_hf(prompts, label_token_ids, batch_size=8, num_log_probs
     chunked_prompts = list(chunks(list(sorted_prompts), batch_size))
     chunked_indices = list(chunks(list(sorted_indices), batch_size))
     
-    prompt_iterator = tqdm(enumerate(chunked_prompts), total=len(chunked_prompts), desc="processing prompts") if len(prompts)>20 else enumerate(chunked_prompts)
+    prompt_iterator = tqdm(enumerate(chunked_prompts), total=len(chunked_prompts), desc="processing prompts") if len(prompts)>100 else enumerate(chunked_prompts)
 
     for i, test_chunk_prompts in prompt_iterator:
         resp = complete_batch_generation_hf(test_chunk_prompts, label_token_ids, num_log_probs=num_log_probs, in_context_logprobs=in_context_logprobs)
@@ -476,10 +480,12 @@ def get_logprobs_for_position(logits, hidden_states, label_token_ids, label_toke
     top_logprobs = torch.log_softmax(top_logits, dim=-1)
     
     num_layers = len(hidden_states)
-    percentile_layers = [int(p * num_layers) for p in (0.6, 0.7, 0.8)]
-    cur_position_hidden_states = np.concatenate(
-        [hidden_states[l][batch_idx][position].cpu().float().numpy() for l in percentile_layers]
-    )
+    # percentile_layers = [int(p * num_layers) for p in (0.6, 0.7, 0.8)]
+    # cur_position_hidden_states = np.concatenate(
+    #     [hidden_states[layer][batch_idx][position].cpu().float().numpy() for layer in percentile_layers]
+    # )
+    layer = int(0.8*num_layers)
+    cur_position_hidden_states = hidden_states[layer][batch_idx][position].cpu().float().numpy()
     
     temp, temp_logits = {}, {}
     
@@ -490,7 +496,7 @@ def get_logprobs_for_position(logits, hidden_states, label_token_ids, label_toke
     
     logprobs['top_logprobs'].append(temp)
     logprobs['token_logits'].append(temp_logits)
-    logprobs['hidden_states'].append(cur_position_hidden_states.cpu().float().numpy())
+    logprobs['hidden_states'].append(cur_position_hidden_states)
     
     return logprobs
 
@@ -523,7 +529,7 @@ def get_in_context_token_positions(input_ids: torch.Tensor):
     
     return positions[:, :-1]  # [batch, num_shots-1], drop test query
 
-def complete_generation_vllm(prompts, label_token_ids=None, num_log_probs=None, in_context_logprobs=False, sample_logprobs=False, sample_n=20):
+def complete_generation_vllm(prompts, label_token_ids=None, num_log_probs=None, in_context_logprobs=False, sample_logprobs=True, sample_n=20):
     ''' This function runs inference using vLLM but places the outputs into a json that looks just like the one
      provided by the OpenAI API. '''
     global infer_tokenizer

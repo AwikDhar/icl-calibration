@@ -4,17 +4,15 @@ import matplotlib.pyplot as plt
 import numpy as np
 from calibration_methods import CalibrationMethods
 from plot_results.results_utils import get_saved_results, cvt_to_sampling_type, get_metric_display_name
-from plot_results.results_utils import SAVE_DIR_TMP, ROOT_DIR, METHOD_NAME_MAP, METHOD_COLOUR_MAP
-
-PLOT_DIR = ROOT_DIR / "plot_results" / "comparisons"
+from plot_results.results_utils import SAVE_DIR, PLOT_DIR, METHOD_NAME_MAP, METHOD_COLOUR_MAP
 
 plt.rcParams.update({
-    'font.size': 25,        
+    'font.size': 30,        
     'lines.linewidth': 2.5,
     'grid.linewidth': 1.5,
-    'xtick.labelsize': 20,    
-    'ytick.labelsize': 20,    
-    'legend.fontsize': 20,    
+    'xtick.labelsize': 25,    
+    'ytick.labelsize': 25,    
+    'legend.fontsize': 25,    
     'axes.labelsize': 25      
 })
 
@@ -85,7 +83,7 @@ def plot_metrics_row(
 
             color = METHOD_COLOUR_MAP[calibration_method]
             ax.plot(all_shots, means, marker=marker, label=method_name, 
-                    color=color, linewidth=2, markersize=6)
+                    color=color, markersize=6)
             ax.fill_between(all_shots, means - stds, means + stds, 
                              alpha=0.2, color=color)
         
@@ -118,7 +116,7 @@ def plot_metrics_row(
     
     metrics_str = '_'.join(metrics)
     filename = save_path / f"{metrics_str}_comparison.png"
-    plt.savefig(filename, dpi=400, bbox_inches='tight')
+    plt.savefig(filename, dpi=300, bbox_inches='tight')
     
     plt.close()
 
@@ -217,7 +215,7 @@ if __name__ == "__main__":
                         help='ICL calibration methods')
     parser.add_argument('--metrics', type=str, required=True,
                         help='metrics to plot comparisons on')
-    parser.add_argument('--results_dir', type=str, default=SAVE_DIR_TMP,
+    parser.add_argument('--results_dir', type=str, default=SAVE_DIR,
                         help='Directory containing saved results of experiments')
     parser.add_argument('--save_dir', type=str, default=str(PLOT_DIR),
                         help='Directory to save calibration method comparison plots')

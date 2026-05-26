@@ -5,9 +5,10 @@ import matplotlib.pyplot as plt
 import pickle
 from sampling_strategies import EntropyLevels, SamplingStrategy
 from calibration_methods import CalibrationMethods
+from utils.gen_utils import SAVE_DIR
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-SAVE_DIR = ROOT_DIR/"saved_results_rebuttal/20_samples"
+PLOT_DIR = ROOT_DIR / "plot_results" / "comparisons_emnlp"
 
 METHOD_NAME_MAP = {
     CalibrationMethods.UNCALIBRATED: "Uncalibrated",

@@ -78,7 +78,7 @@ class CalibrationMetrics():
         if binned:
             return binned_ce.ece, binned_ce.mce, None
         
-        timeout_sec=10
+        timeout_sec=60
         try:
             with time_limit(timeout_sec):
                 out = smooth_ece(logits, labels, prepare_rel_diag, plot_confidence_band)
@@ -87,6 +87,7 @@ class CalibrationMetrics():
                 return out.item(), binned_ce.mce, None
         except TimeoutException:
             import logging
+            # print(f"Smooth ECE calculation timed out after {timeout_sec} seconds, falling back to binned ECE")
             logging.error(f"Smooth ECE calculation timed out after {timeout_sec} seconds, falling back to binned ECE")
             return binned_ce.ece, binned_ce.mce, None
     

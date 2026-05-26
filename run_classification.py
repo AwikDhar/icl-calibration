@@ -112,7 +112,7 @@ def run_and_save_results(params_list: List[Dict], datasets: Dict):#, min_confide
         
         file_name = get_saved_results_file_name(params)
         if os.path.isfile(file_name) and params['overwrite_type'] is OverWriteType.SKIP:
-            logging.info(f"Skipping experiment shot {params['num_shots']} seed {params['seed']}, already done before.")
+            logger.info(f"Skipping experiment shot {params['num_shots']} seed {params['seed']}, already done before.")
             continue
         logger.info(params)
         # pprint.pprint(params)
@@ -124,10 +124,6 @@ def run_and_save_results(params_list: List[Dict], datasets: Dict):#, min_confide
         dataset: IclDataset = datasets[params['dataset']]
         all_train_sentences, all_train_labels, all_train_embeddings = dataset.train.sentences, dataset.train.labels, dataset.train.embeddings 
         all_test_sentences, all_test_labels, all_test_embeddings = dataset.test.sentences, dataset.test.labels, dataset.test.embeddings
-        # all_sentences, all_labels, all_embeddings = dataset.train.sentences, dataset.train.labels, dataset.train.embeddings 
-        # split_size = int(0.8*len(all_sentences))
-        # all_train_sentences, all_train_labels, all_train_embeddings = all_sentences[:split_size], all_labels[:split_size], all_embeddings[:split_size]
-        # all_test_sentences, all_test_labels, all_test_embeddings = all_sentences[split_size:], all_labels[split_size:], all_embeddings[split_size:]
         
         logger.info("Train sizes: %d sentences, %d labels, %d embeddings | Test sizes: %d sentences, %d labels, %d embeddings",
                 len(all_train_sentences), len(all_train_labels), len(all_train_embeddings),
@@ -232,7 +228,8 @@ def run_and_save_results(params_list: List[Dict], datasets: Dict):#, min_confide
 
             if CalibrationMethods.TF in calibration_methods:
                 combined_sentences = [train_sentences[test_idx] + [test_sentences[test_idx]] for test_idx in range(len(test_sentences))]
-                calibrated_logits[CalibrationMethods.TF] = get_tc_logits(params, combined_sentences, train_labels, train_logits, logits, 'google/embeddinggemma-300m')
+                calibrated_logits[CalibrationMethods.TF] = get_tc_logits(params, combined_sentences, train_labels, train_logits, logits)
+                # calibrated_logits[CalibrationMethods.TF] = get_tc_logits(params, combined_sentences, train_labels, train_logits, logits, 'google/embeddinggemma-300m')
                 # calibrated_logits[CalibrationMethods.TF] = get_tc_logits(params, combined_sentences, train_labels, train_logits, calibrated_logits[CalibrationMethods.TF], 'google/embeddinggemma-300m')
                 metrics[CalibrationMethods.TF] = ClassificationMetrics(logits, calibrated_logits[CalibrationMethods.TF], test_labels)
             
@@ -453,12 +450,11 @@ def get_tc_logits(
     combined_sentences: List[str] | List[np.ndarray],
     train_labels: List[int],
     train_logits: np.ndarray,
-    logits: np.ndarray,
-    embedding_model_name: str):
+    logits: np.ndarray):
 
     inputs_batch = []
     for i in range(len(logits)):
-        inputs = generate_calibrator_inputs(params, combined_sentences[i], train_labels[i], train_logits[i].copy(), logits[i].copy(), embedding_model_name)
+        inputs = generate_calibrator_inputs(train_labels[i], train_logits[i].copy(), logits[i].copy())
         inputs_batch.append(inputs)
     
     inputs_batch = torch.stack(inputs_batch)
@@ -473,12 +469,9 @@ def get_tc_logits(
     return calibrated_logits.cpu().numpy()
 
 def generate_calibrator_inputs(
-    params: Dict,
-    combined_sentences: List[str] | List[np.ndarray],
     train_labels: List[int],
     train_logits: np.ndarray,
-    test_logits: np.ndarray,
-    embedding_model_name: str):
+    test_logits: np.ndarray):
         
     logits = np.vstack([train_logits, test_logits])
     
@@ -493,19 +486,7 @@ def generate_calibrator_inputs(
     # repeat last train label to get a dummy test label since the func expects same length list as the other probs and preds
     shifted_features = get_shifted_features(probs, preds, train_labels+train_labels[-1:]) 
     
-    lower_dim_embeddings = torch.tensor(get_embeddings(params, 
-                                                       sentences=combined_sentences,
-                                                       embedding_model_name=embedding_model_name), 
-                                        dtype=torch.float32)
-    # noise = torch.rand_like(lower_dim_embeddings)
-
-    # # This gives a unique random permutation for EVERY row
-    # indices = torch.argsort(noise, dim=-1)
-
-    # # 3. Use gather to apply these unique indices to your embeddings
-    # lower_dim_embeddings = torch.gather(lower_dim_embeddings, dim=-1, index=indices)
-    
-    # Input to the calibration transformer is a concatenation of t<k shot probs, similarities and other features
+    # Input to the calibration transformer is a concatenation of t<k shot probs and other features
     inputs = [
         np.concatenate((
             [pred_probs[sent_idx]], 
@@ -524,7 +505,7 @@ def generate_calibrator_inputs(
         ), 
         dim=0)
     
-    inputs = torch.cat((gt_prob_mses, inputs[:,:3], second_highest_probs, lower_dim_embeddings), dim=-1)
+    inputs = torch.cat((gt_prob_mses, inputs[:,:3], second_highest_probs), dim=-1)
     
     return inputs
 
@@ -538,7 +519,9 @@ def get_permutation_averaged_logits(params, train_sentences, train_labels, test_
         permuted_train_sentences = [[train_sentences[test_idx][train_idx] for train_idx in shuffled_idxs] for test_idx in range(len(test_sentences))]
         permuted_train_labels = [[train_labels[test_idx][train_idx] for train_idx in shuffled_idxs] for test_idx in range(len(test_sentences))]
         
-        permut_probs, permut_logits = get_results(params, permuted_train_sentences, permuted_train_labels, test_sentences)
+        llm_result = get_results(params, permuted_train_sentences, permuted_train_labels, test_sentences)
+        permut_probs = np.array([llm_result.logprobs[i].probs[0] for i in range(len(test_sentences))])
+        
         pred_probs.append(permut_probs)
         # print(train_sentences[0])
         # print(permuted_train_sentences[0])
@@ -594,7 +577,9 @@ def get_prompt_semantic_prior(params, sentences, labels):
     train_labels = [labels[:sent_idx] + labels[sent_idx+1:] for sent_idx in range(len(sentences))]
     test_sentences = [sentences[sent_idx] for sent_idx in range(len(sentences))]
     
-    probs, logits = get_results(params, train_sentences, train_labels, test_sentences)
+    llm_result = get_results(params, train_sentences, train_labels, test_sentences)
+    probs = np.array([llm_result.logprobs[i].probs[0] for i in range(len(test_sentences))])
+    
     semantic_prior = np.mean(probs, axis=0)
     
     return semantic_prior 
@@ -679,10 +664,7 @@ def process_args(args):
     args['overwrite_type'] = OverWriteType[args['overwrite_type'].upper()]
     
 if __name__ == '__main__':
-    # vllm stuff
-    # mp.set_start_method('fork', force=True)
-    # setup_single_threading()
-    
+        
     parser = argparse.ArgumentParser()
     # required arguments
     parser.add_argument('--model', dest='models', action='store', required=True, help='name of model(s), e.g., GPT2-XL')
@@ -696,8 +678,6 @@ if __name__ == '__main__':
                             choices=["entropy", "similarity"],
                             help='how to sample the ICL examples')
     parser.add_argument('--entropy_levels', dest='entropy_levels', action='store', required=False,
-                            # default="rand", 
-                            # choices=["rand", "rand_shared", "max", "labelspike", "labelsuppress"],
                             help='the levels of entropy for sampling ICL examples')
     parser.add_argument('--prompt_shared', dest='prompt_shared',  action='store_true', required=False, default=False,
                             help='Whether or not to use the same in context examples for the batch of test inputs. \
@@ -741,14 +721,8 @@ if __name__ == '__main__':
     os.environ['CUDA_VISIBLE_DEVICES'] = ",".join([str(gpu_id) for gpu_id in args['gpu_ids']])
     setup_vllm_env_settings()
     from utils.run_utils import *
-    # logger.handlers.clear()
-
+    
     logger = setup_logger(__name__)
     logger.propagate=False 
     
-    # logging.getLogger().setLevel(logging.INFO)  # keep root quiet
-    # logger.setLevel(logging.INFO)  # your main logger
-    # logging.getLogger('utils.run_utils').setLevel(logging.INFO)
-    # logging.getLogger(__name__).setLevel(logging.INFO)
-
     main(**args)

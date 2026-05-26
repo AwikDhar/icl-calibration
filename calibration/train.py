@@ -52,6 +52,7 @@ def main(llms: List[str],
          datasets_dropout: float,
          temp_augment: bool,
          label_augment: bool,
+         volume_fraction: float,
          calibrator_output_type: CalibratorOutputType,
          feature_type: str,
          sampling_strategies:List[str],
@@ -86,12 +87,17 @@ def main(llms: List[str],
     
     device = f'cuda:{gpu_id}'
     
-    data = load_datasets(llms, datasets, device, feature_type, splits=('train',), temp_augment=temp_augment, label_augment=label_augment, sampling_strategies=sampling_strategies, purpose="calibrator training")
+    fix_seed(seed=42)
+    data = load_datasets(llms, datasets, device, feature_type, splits=('train',), temp_augment=temp_augment, label_augment=label_augment, volume_fraction=volume_fraction, sampling_strategies=sampling_strategies, purpose="calibrator training")
     unseen_data = load_datasets(llms, unseen_datasets, device, feature_type, shots_end=shots_end, splits=('test',), temp_augment=False, label_augment=False, sampling_strategies=sampling_strategies, purpose="calibrator validation")
           
     for llm in llms:
         for dataset in unseen_datasets:
-            data[llm][dataset] = unseen_data[llm][dataset]
+            if dataset not in data[llm]:
+                data[llm][dataset] = unseen_data[llm][dataset]
+            else:
+                for sampling_strategy in sampling_strategies:
+                    data[llm][dataset][sampling_strategy]['test'] = unseen_data[llm][dataset][sampling_strategy]['test']
         
     sample_model, sample_dataset, sample_strategy = llms[0], datasets[0], sampling_strategies[0]
     T, C = data[sample_model][sample_dataset][sample_strategy]['train']['inputs'][0].shape
@@ -106,10 +112,10 @@ def main(llms: List[str],
         seed_train_ds = random.sample(datasets, seed_train_ds_count)
         # print(seed_train_ds_count); exit()
         model_dir = f"./calibration/models/"+ (llms[0].replace('/','_') if len(llms)==1 else 'llm_agnostic')
-        if len(sampling_strategies)==1:
-            model_dir += f"/{sampling_strategies[0]}"
         if ablation_method:
             model_dir += f"/ablations/{ablation_method}"
+        if len(sampling_strategies)==1:
+            model_dir += f"/{sampling_strategies[0].lower()}"
         if num_seeds>1:
             model_dir += f"/{seed}_seed"
             
@@ -339,7 +345,7 @@ def eval(model, calibrator_output_type, data, shots_start, batch_size):
         for llm in data:
             for dataset in data[llm]:
                 for sampling_strategy in data[llm][dataset]:
-                    if 'train' in data[llm][dataset][sampling_strategy]:
+                    if 'test' not in data[llm][dataset][sampling_strategy]:
                         continue
                     # print(dataset)
                     inputs, logits, labels = get_batch(data[llm][dataset][sampling_strategy]['test'], batch_size) # B,T,C | B,T,num_classes | B,T
@@ -347,7 +353,7 @@ def eval(model, calibrator_output_type, data, shots_start, batch_size):
                     # num_classes = logits.shape[-1]
                                     
                     outputs = model(inputs) # B,T,1
-                    calibrated_logits, loss = get_calibrated_logits_loss(logits, outputs, calibrator_output_type, labels, shots_start)
+                    calibrated_logits, loss = get_calibrated_logits_loss(logits, outputs, calibrator_output_type, labels, shots_start, num_iters=30) # defaulted to 10 till 15-05
                     
                     total_loss += loss
                     
@@ -381,12 +387,12 @@ def eval(model, calibrator_output_type, data, shots_start, batch_size):
         
         return total_loss, metrics
    
-def get_calibrated_logits_loss(logits, outputs, calibrator_output_type, labels, shots_start, num_iters=10):
+def get_calibrated_logits_loss(logits, outputs, calibrator_output_type, labels, shots_start, num_iters=15):
     if calibrator_output_type is CalibratorOutputType.CALIBRATED_PROBABILITY:
         return get_correctness_calibrated_logits_loss(logits, outputs, labels, shots_start, num_iters)
 
     if calibrator_output_type is CalibratorOutputType.TEMPERATURE:
-        return get_temperature_calibrated_logits_loss(logits, outputs, labels, shots_start, num_iters)
+        return get_temperature_calibrated_logits_loss(logits, outputs, labels, shots_start)
 
 def get_correctness_calibrated_logits_loss(logits, calibrated_pred_probs, labels, shots_start, num_iters):
     correctness_labels = (logits.argmax(dim=-1)==labels).float()        
@@ -489,7 +495,7 @@ def args_check(args: Dict):
     assert args['batch_size'] > 0, "batch_size must be positive"
 
 def set_torch_env():
-    torch._dynamo.config.cache_size_limit = 32 
+    torch._dynamo.config.cache_size_limit = 64 
     torch.set_float32_matmul_precision('high') # better performance as per warning during torch.compile
     
 if __name__ == '__main__':
@@ -510,6 +516,8 @@ if __name__ == '__main__':
                         help="Whether or not to randomly temperature scale data logits(and affect features) for robust training")
     parser.add_argument('--label_augment', dest='label_augment', action='store_const', const=True, default=False,
                         help="Whether or not to randomly sample synthetic labels from a temp scaled prob distribution for accuracy variation/robust training")
+    parser.add_argument('--volume_fraction', action='store', default=1, type=float,
+                        help="What fraction of the dataset to load and use for training")
     
     
     # general training args
@@ -520,7 +528,7 @@ if __name__ == '__main__':
                         help='batch size for model training')
     
     # ablation related
-    parser.add_argument('--calibrator_output_type', action='store', required=False, default="calibrated_probability", help='What the transformer calibrator outputs(temperature/calibrated probability)')
+    parser.add_argument('--calibrator_output_type', action='store', required=False, default="calibrated_probability", help='What the transformer calibrator outputs(temperature/calibrated_probability)')
     parser.add_argument('--ablation_method', action='store', required=False, default=None, help='Ablation method name, if performing ablation')
     parser.add_argument('--num_seeds', action='store', required=False, default=1, type=int, help='Number of seeds to train calibrators for')
     parser.add_argument('--seed_start', action='store', required=False, default=0, type=int, help='Which seed # to start training from')
