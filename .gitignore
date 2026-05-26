@@ -2,6 +2,7 @@
 *.out
 *.log
 *.json
+*.jsonl
 *.pkl
 *.pt
 *.png
