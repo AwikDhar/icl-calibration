@@ -15,7 +15,7 @@ from calibration.model import CalibrationTransformer, CalibratorOutputType, Posi
 from metrics import CalibrationMetrics
 
 from calibration_plot_data import CalibrationPlotData
-from calibration.train import get_batch, get_calibrated_logits_loss, load_datasets 
+from calibration.train import get_batch, get_calibrated_logits_loss, initialise_calibrator, load_datasets 
 from calibration.temperature import get_shotwise_dynamic_temperatures, get_shotwise_static_temperatures, get_equivalent_temp
 from calibration.comparison_result import ComparisonResult, CalibrationMethodResult 
 
@@ -26,6 +26,7 @@ def main(llms,
          feature_type,
          shots_start,
          shots_end,
+         calibrator_type: str,
          calibrator_output_type,
          sampling_strategies = None,
          ablation_method: str = None,
@@ -54,9 +55,7 @@ def main(llms,
     comparison_results: List[ComparisonResult] = []
     
     for seed in tqdm(range(num_seeds), desc='Evaluating checkpoints'):
-        # if num_seeds>1:
-        #     print(f"Seed : {seed}")
-        
+                
         model_dir = f"./calibration/models/"
         if llm_agnostic or len(llms)>1: 
             model_dir += 'llm_agnostic' 
@@ -86,19 +85,7 @@ def main(llms,
             
             validation_eces.append({"seed":seed, "ece":seed_val_ece})
                     
-        with open(f"calibration/models/transformer_config.json", 'r') as file:
-            config = json.load(file)
-            
-        calibrator = CalibrationTransformer(
-            in_features=C, 
-            context_length=config['context_length'], 
-            embedding_dim=config['embedding_dim'], 
-            num_heads=config['num_heads'], 
-            num_layers=config['num_layers'],
-            dropout=0,
-            pos_embedding_type=PositionEmbeddingType.SINUSOIDAL,
-            output_type=calibrator_output_type,
-        ).to(device)
+        calibrator = initialise_calibrator(calibrator_type, C, calibrator_output_type, device)
         
         # if seed==0:
         #     print(calibrator)
@@ -179,8 +166,8 @@ def main(llms,
             "briers": [comparison_result.calibrated.brier for comparison_result in comparison_results]
         }
         
-    with open(eval_path, "w") as file:
-        json.dump(eval_metrics, file, indent=2)
+    # with open(eval_path, "w") as file:
+    #     json.dump(eval_metrics, file, indent=2)
      
 def eval(calibrator, 
          calibrator_output_type,
@@ -445,6 +432,8 @@ if __name__ == '__main__':
     parser.add_argument('--shots_end', action='store', required=False, type=int, default=None, help='Till which shot # we will do calibration eval')
     parser.add_argument('--sampling_strategies', action='store', required=False, default=None, help='what sampling strategy data to select(entropy vs similarity) (default: None - means select all)')
     
+    parser.add_argument('--calibrator_type', action='store', required=False, default='transformer',
+                        choices=['transformer', 'mlp', 'rnn', 'lstm', 'logistic'], help='which calibrator architecture to train')
     parser.add_argument('--calibrator_output_type', action='store', required=False, default="calibrated_probability", help='What the transformer calibrator outputs(temperature/calibrated_probability)')
     parser.add_argument('--ablation_method', action='store', required=False, default=None, help='Ablation method name, if performing ablation')
     parser.add_argument('--num_seeds', action='store', required=False, default=1, type=int, help='Number of seeds to train calibrators for')

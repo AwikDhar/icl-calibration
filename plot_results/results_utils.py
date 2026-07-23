@@ -8,7 +8,7 @@ from calibration_methods import CalibrationMethods
 from utils.gen_utils import SAVE_DIR
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
-PLOT_DIR = ROOT_DIR / "plot_results" / "comparisons_emnlp"
+PLOT_DIR = ROOT_DIR / "plot_results" / "comparisons_check"
 
 METHOD_NAME_MAP = {
     CalibrationMethods.UNCALIBRATED: "Uncalibrated",

@@ -217,7 +217,7 @@ def recalculate_features(item: Dict, temp_augment=False, label_augment=False):
             ], device=device
         )
 
-    permute_embeddings = True
+    permute_embeddings = False
     if permute_embeddings:
         embedding: torch.Tensor = item['inputs'][:, -128:]
 

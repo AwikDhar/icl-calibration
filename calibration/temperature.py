@@ -1,5 +1,8 @@
 import argparse
 import json
+import numpy as np
+from sklearn.isotonic import IsotonicRegression
+from sklearn.linear_model import LogisticRegression
 import torch
 import torch.nn.functional as F
 
@@ -267,20 +270,89 @@ def tune_temp_for_sequence(logits_seq: torch.TensorType, labels_seq: torch.Tenso
         
     return temperatures
 
-def get_shotwise_dynamic_temperatures(data, shots_start):
-    logits, labels = data['logits'], data['labels'] # len(eval),T,num_classes | len(eval),T
+def _fit_predict_calibrated_prob(conf_hist: np.ndarray, correct_hist: np.ndarray,
+                                  conf_query: float, method: str,
+                                  min_fit_points: int = 2) -> float:
+    has_enough_points = len(conf_hist) >= min_fit_points
+    has_both_classes = has_enough_points and (len(np.unique(correct_hist)) > 1)
+ 
+    if not has_both_classes:
+        return conf_query
+ 
+    if method == 'isotonic_cal':
+        regressor = IsotonicRegression(y_min=0.0, y_max=1.0, out_of_bounds='clip')
+        regressor.fit(conf_hist, correct_hist)
+        return float(regressor.predict([conf_query])[0])
+ 
+    elif method == 'beta_cal':
+        eps = 1e-6
+        def beta_features(p):
+            p = np.clip(p, eps, 1 - eps)
+            return np.stack([np.log(p), np.log(1 - p)], axis=-1)
+ 
+        regressor = LogisticRegression()
+        regressor.fit(beta_features(conf_hist), correct_hist)
+        return float(regressor.predict_proba(beta_features(np.array([conf_query])))[0, 1])
+ 
     
-    B,T,num_classes = logits.shape
+def get_shotwise_scalar_calibrated_temperatures(logits: torch.Tensor, labels: torch.Tensor,
+                                                 shots_start: int, method: str,
+                                                 equivalent_temp_iters: int = 500):
+    B, T, num_classes = logits.shape
+    device = logits.device
+ 
+    probs = F.softmax(logits, dim=-1)
+    confidences = probs.max(dim=-1).values  # (B, T)
+    correctness = (logits.argmax(dim=-1) == labels).float()  # (B, T)
+ 
+    confidences_np = confidences.detach().cpu().numpy().astype(np.float64)
+    correctness_np = correctness.detach().cpu().numpy().astype(np.float64)
+ 
     tuned_temps = {}
-    temp_init = None
-    
+ 
     for shot in range(shots_start, T):
-        logits_seq, labels_seq = logits[:, :shot, :], labels[:, :shot]
-        tuned_temps[shot] = tune_temp_for_sequence(logits_seq, labels_seq, temp_init)
-        
-        temp_init = tuned_temps[shot]
-        
+        calibrated_probs = np.empty(B, dtype=np.float64)
+ 
+        for b in range(B):
+            conf_hist = confidences_np[b, :shot]
+            correct_hist = correctness_np[b, :shot]
+            conf_query = confidences_np[b, shot]
+ 
+            calibrated_probs[b] = _fit_predict_calibrated_prob(
+                conf_hist, correct_hist, conf_query, method
+            )
+ 
+        calibrated_probs_t = torch.tensor(calibrated_probs, device=device, dtype=logits.dtype).view(B, 1, 1)
+        query_logits = logits[:, [shot], :]  # (B, 1, num_classes)
+ 
+        equivalent_temp = get_equivalent_temp(query_logits, calibrated_probs_t, num_iters=equivalent_temp_iters)  # (B, 1, 1)
+        tuned_temps[shot] = equivalent_temp.view(B)
+ 
     return tuned_temps
+
+def get_shotwise_dynamic_temperatures(data, shots_start, method: str = 'temp_scaling'):
+    logits, labels = data['logits'], data['labels'] # len(eval),T,num_classes | len(eval),T
+ 
+    if method == 'temp_scaling':
+        B,T,num_classes = logits.shape
+        tuned_temps = {}
+        temp_init = None
+ 
+        for shot in range(shots_start, T):
+            logits_seq, labels_seq = logits[:, :shot, :], labels[:, :shot]
+            tuned_temps[shot] = tune_temp_for_sequence(logits_seq, labels_seq, temp_init)
+ 
+            temp_init = tuned_temps[shot]
+ 
+        return tuned_temps
+ 
+    elif method in ('beta_cal', 'isotonic_cal'):
+        return get_shotwise_scalar_calibrated_temperatures(logits, labels, shots_start, method)
+ 
+    else:
+        raise NotImplementedError(
+            f"method `{method}` not available, please pick one from ['temp_scaling', 'beta_cal', 'isotonic_cal']"
+        )
 
 def main(llms, 
          datasets,

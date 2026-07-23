@@ -13,7 +13,11 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from calibration.model import CalibrationTransformer, PositionEmbeddingType, CalibratorOutputType
+from calibration.model import (
+    CalibrationTransformer, PositionEmbeddingType, CalibratorOutputType, 
+    CalibrationLSTM, CalibrationRNN, 
+    CalibrationMLP, CalibrationLogisticRegressor
+)
 from calibration.temperature import get_equivalent_temp, get_equivalent_temp_gd
 from calibration.data_utils import fix_seed, load_datasets, get_batch, reshuffle_embeddings
 
@@ -53,6 +57,7 @@ def main(llms: List[str],
          temp_augment: bool,
          label_augment: bool,
          volume_fraction: float,
+         calibrator_type: str,
          calibrator_output_type: CalibratorOutputType,
          feature_type: str,
          sampling_strategies:List[str],
@@ -127,23 +132,11 @@ def main(llms: List[str],
             logging.info(f"Skipping seed {seed}, already done before.")
             continue
         
-        with open(f"calibration/models/transformer_config.json", 'r') as file:
-            config = json.load(file)
-            
-        calibrator = CalibrationTransformer(
-            in_features=C, 
-            context_length=config['context_length'], 
-            embedding_dim=config['embedding_dim'], 
-            num_heads=config['num_heads'], 
-            num_layers=config['num_layers'],
-            dropout=config['dropout'],
-            pos_embedding_type=PositionEmbeddingType.SINUSOIDAL,
-            output_type=calibrator_output_type,
-        ).to(device)
+        calibrator = initialise_calibrator(calibrator_type, C, calibrator_output_type, device)
         
         print(calibrator)
         print(f"{sum(p.numel() for p in calibrator.parameters())/10**6: .2f} M parameters")
-        
+        # exit()
         if resume_saved_ckpt:
             state_dict = torch.load(model_path, weights_only=True)
             cleaned_state_dict = {}
@@ -364,7 +357,7 @@ def eval(model, calibrator_output_type, data, shots_start, batch_size):
                     for shot in range(shots_start, T):
                         shot_metrics = CalibrationMetrics(
                             logits[:, [shot], :], calibrated_logits[:, [shot], :], labels[:, [shot]], 
-                            shots_start=0, binned=False
+                            shots_start=0, binned=True
                         )
                         if cur_metrics is None:
                             cur_metrics = shot_metrics
@@ -489,6 +482,39 @@ def get_optimizer(model, learning_rate=1e-3, weight_decay_attn=0.00, weight_deca
     
     return optimizer
 
+def initialise_calibrator(calibrator_type: str, in_features: int, calibrator_output_type: CalibratorOutputType, device: str) -> nn.Module:
+    """Builds the calibrator model for the given architecture type.
+    ...
+    """
+    calibrator_type = calibrator_type.lower()
+
+    if calibrator_type=='transformer':
+        with open(f"calibration/models/transformer_config.json", 'r') as file:
+            config = json.load(file)
+
+        calibrator = CalibrationTransformer(
+            in_features=in_features, 
+            context_length=config['context_length'], 
+            embedding_dim=config['embedding_dim'], 
+            num_heads=config['num_heads'], 
+            num_layers=config['num_layers'],
+            dropout=config['dropout'],
+            pos_embedding_type=PositionEmbeddingType.SINUSOIDAL,
+            output_type=calibrator_output_type,
+        )
+    elif calibrator_type=='mlp':
+        calibrator = CalibrationMLP(output_type=calibrator_output_type)
+    elif calibrator_type=='rnn':
+        calibrator = CalibrationRNN(in_features=in_features, output_type=calibrator_output_type)
+    elif calibrator_type=='lstm':
+        calibrator = CalibrationLSTM(in_features=in_features, output_type=calibrator_output_type)
+    elif calibrator_type=='logistic':
+        calibrator = CalibrationLogisticRegressor(output_type=calibrator_output_type)
+    else:
+        raise NotImplementedError(f"calibrator_type `{calibrator_type}` not available, please pick one from ['transformer', 'mlp', 'rnn', 'lstm', 'logistic']")
+
+    return calibrator.to(device)
+
 def args_check(args: Dict):
     assert args['iterations'] > 0, "iterations must be positive"
     assert args['lr'] > 0, "lr must be positive"
@@ -497,6 +523,7 @@ def args_check(args: Dict):
 def set_torch_env():
     torch._dynamo.config.cache_size_limit = 64 
     torch.set_float32_matmul_precision('high') # better performance as per warning during torch.compile
+    torch._dynamo.config.allow_rnn=True
     
 if __name__ == '__main__':
     logger = setup_logger()
@@ -528,6 +555,8 @@ if __name__ == '__main__':
                         help='batch size for model training')
     
     # ablation related
+    parser.add_argument('--calibrator_type', action='store', required=False, default='transformer',
+                        choices=['transformer', 'mlp', 'rnn', 'lstm', 'logistic'], help='which calibrator architecture to train')
     parser.add_argument('--calibrator_output_type', action='store', required=False, default="calibrated_probability", help='What the transformer calibrator outputs(temperature/calibrated_probability)')
     parser.add_argument('--ablation_method', action='store', required=False, default=None, help='Ablation method name, if performing ablation')
     parser.add_argument('--num_seeds', action='store', required=False, default=1, type=int, help='Number of seeds to train calibrators for')

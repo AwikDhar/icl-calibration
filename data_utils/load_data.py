@@ -287,6 +287,22 @@ def set_prompt_params(params: Dict):
         params["a_prefix"] = "Answer: "
         set_label_tokens(labels, params)
     
+    elif params['dataset'] == 'mmlu':
+        labels = ['A', 'B', 'C', 'D']
+        
+        params['prompt_prefix'] = f"Your task is to answer the given question by specifying the correct option({', '.join(labels)})"
+        params["q_prefix"] = "Question: "
+        params["a_prefix"] = "Answer: "
+        set_label_tokens(labels, params)
+    
+    elif params['dataset'] == 'winogrande':
+        labels = ['A', 'B']
+        
+        params['prompt_prefix'] = f"Your task is to fill in the blanks by specifying the correct option({', '.join(labels)})"
+        params["q_prefix"] = "Sentence: "
+        params["a_prefix"] = "Answer: "
+        set_label_tokens(labels, params)
+           
     elif params['dataset'] == 'strategy_qa':
         params['prompt_prefix'] = ""
         params["q_prefix"] = "Question: "

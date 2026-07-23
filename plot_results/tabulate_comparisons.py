@@ -28,7 +28,7 @@ def format_metric(metric_dict, show_std):
     mean = metric_dict['mean']
     std = metric_dict['std']
     
-    if mean > 2:  # Not brier loss. A percentage. 1 decimal precision (fix this heuristic)
+    if mean > 1:  # Not brier loss. A percentage. 1 decimal precision (fix this heuristic)
         return f"{mean:.1f} ± {std:.1f}" if show_std else  f"{mean:.1f}"
     
     return f"{mean:.3f} ± {std:.3f}" if show_std else f"{mean:.3f}"

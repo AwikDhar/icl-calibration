@@ -1,9 +1,10 @@
 ninja==1.13.0
 tqdm==4.67.1
 msgspec==0.19.0
-vllm==0.13.0
-datasets==4.4.2
-sentence-transformers==5.2.0
-google-auth==2.43.0
-google-genai==1.55.0
+torch==2.10.0
+vllm==0.19.0
+datasets==4.8.4
+sentence-transformers==5.3.0
+google-auth==2.49.1
+google-genai==1.70.0
 relplot==1.0.1

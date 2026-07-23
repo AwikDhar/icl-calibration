@@ -552,7 +552,7 @@ def load_yelp_reviews():
 
 def load_yahoo_answers():
     dataset = datasets.load_dataset('community-datasets/yahoo_answers_topics').shuffle(seed=42)
-    print(len(dataset['train']), len(dataset['test']))
+    # print(len(dataset['train']), len(dataset['test']))
     # print(dataset['train']['topic'][0], dataset['train'].features['topic'].names, dataset['train'].features['topic'].int2str(0)); exit()
     def length_filter(example):
         title = example.get('question_title') or ""
@@ -609,7 +609,7 @@ def load_medqa():
     return train_sentences, train_labels, test_sentences, test_labels
 
 def load_medmcqa():
-    dataset = datasets.load_dataset('openlifescienceai/medmcqa').shuffle(seed=42)
+    dataset = datasets.load_dataset('openlifescienceai/medmcqa', ).shuffle(seed=42)
     dataset['train'] = dataset['train'].select(range(min(10**5, len(dataset['train']))))
     
     def format_example(example):
@@ -627,6 +627,52 @@ def load_medmcqa():
     train_labels = list(dataset['train']['cop'])
     test_sentences = list(dataset['test']['text'])
     test_labels = list(dataset['test']['cop'])
+    
+    return train_sentences, train_labels, test_sentences, test_labels
+
+def load_mmlu():
+    dataset = datasets.load_dataset('cais/mmlu', 'all').shuffle(seed=42)
+    dataset['train'] = dataset['auxiliary_train'].select(range(min(10**5, len(dataset['auxiliary_train']))))
+
+    def format_example(example):
+        # Combine question with options
+        question_text = example['question'] + "\n"
+        for idx, key in enumerate(['A', 'B', 'C', 'D']):
+            question_text += f"{key}. {example['choices'][idx]}\n"
+        example['text'] = question_text
+        
+        return example
+    
+    dataset = dataset.map(format_example)
+    
+    train_sentences = list(dataset['train']['text'])
+    train_labels = list(dataset['train']['answer'])
+    test_sentences = list(dataset['test']['text'])
+    test_labels = list(dataset['test']['answer'])
+    
+    return train_sentences, train_labels, test_sentences, test_labels
+
+def load_winogrande():
+    dataset = datasets.load_dataset('allenai/winogrande', 'winogrande_debiased').shuffle(seed=42)
+    dataset.pop('test') # has no labels, not useful 
+
+    def format_example(example):
+        # Combine question with options
+        question_text = example['sentence'] + "\n"
+        question_text += f"A. {example['option1']}\n"
+        question_text += f"B. {example['option2']}\n"
+        example['text'] = question_text
+        
+        example['answer'] = int(example['answer']) - 1
+        
+        return example
+    
+    dataset = dataset.map(format_example)
+    
+    train_sentences = list(dataset['train']['text'])
+    train_labels = list(dataset['train']['answer'])
+    test_sentences = list(dataset['validation']['text'])
+    test_labels = list(dataset['validation']['answer'])
     
     return train_sentences, train_labels, test_sentences, test_labels
 
@@ -715,6 +761,12 @@ def load_dataset(params):
     
     elif params['dataset'] == 'medqa':
         orig_train_sentences, orig_train_labels, orig_test_sentences, orig_test_labels = load_medqa()
+    
+    elif params['dataset'] == 'mmlu':
+        orig_train_sentences, orig_train_labels, orig_test_sentences, orig_test_labels = load_mmlu()
+    
+    elif params['dataset'] == 'winogrande':
+        orig_train_sentences, orig_train_labels, orig_test_sentences, orig_test_labels = load_winogrande()
     
     elif params['dataset'] == 'strategy_qa':
         params['prompt_prefix'] = ""

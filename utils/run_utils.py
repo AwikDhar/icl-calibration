@@ -529,7 +529,7 @@ def get_in_context_token_positions(input_ids: torch.Tensor):
     
     return positions[:, :-1]  # [batch, num_shots-1], drop test query
 
-def complete_generation_vllm(prompts, label_token_ids=None, num_log_probs=None, in_context_logprobs=False, sample_logprobs=True, sample_n=20):
+def complete_generation_vllm(prompts, label_token_ids=None, num_log_probs=None, in_context_logprobs=False, sample_logprobs=False, sample_n=20):
     ''' This function runs inference using vLLM but places the outputs into a json that looks just like the one
      provided by the OpenAI API. '''
     global infer_tokenizer
