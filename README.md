@@ -1,4 +1,4 @@
-Official implementation for our AACL 2026 paper [_"Towards Universal Calibration for In-Context Classification"_](https://arxiv.org/abs/2610.17096).
+Official implementation for our paper [_"Towards Universal Calibration for In-Context Classification"_](https://arxiv.org/abs/2610.17096) (AACL-IJCNLP 2026).
 
 ## Dependencies
 
