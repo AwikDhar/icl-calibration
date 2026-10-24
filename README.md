@@ -1,4 +1,4 @@
-Official implementation for the paper _"Towards Universal Calibration for In-Context Classification"_. [https://arxiv.org/abs/2610.17096](paper).
+Official implementation for the paper _"Towards Universal Calibration for In-Context Classification"_. [arXiv](https://arxiv.org/abs/2610.17096).
 
 ## Dependencies
 
