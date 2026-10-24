@@ -1,6 +1,4 @@
-Official implementation for the paper _"Towards Universal Calibration for In-Context Classification"_. Paper will be made available soon.
-
-## Requirements:
+Official implementation for the paper _"Towards Universal Calibration for In-Context Classification"_. [https://arxiv.org/abs/2610.17096](paper).
 
 ## Dependencies
 
@@ -59,16 +57,17 @@ By default embeddinggemma-300m is used to generate embeddings for the queries/se
 python --model="google/embeddinggemma-300m" --dataset="commonsense_qa" --dim=768 --gpu_id=0
 ```
 
-## Adapted from:
+## If your work builds on our paper, please cite our work: 
 
 ```bibtex
-@misc{zhang2024study,
-      title={A Study on the Calibration of In-context Learning}, 
-      author={Hanlin Zhang and Yi-Fan Zhang and Yaodong Yu and Dhruv Madeka and Dean Foster and Eric Xing and Himabindu Lakkaraju and Sham Kakade},
-      year={2024},
-      eprint={2312.04021},
+@misc{dhar2026universalcalibrationincontextclassification,
+      title={Towards Universal Calibration for In-Context Classification}, 
+      author={Awik Dhar and Sunita Sarawagi and Arpit Agarwal},
+      year={2026},
+      eprint={2610.17096},
       archivePrefix={arXiv},
-      primaryClass={cs.CL}
+      primaryClass={cs.LG},
+      url={https://arxiv.org/abs/2610.17096}, 
 }
 ```
 
